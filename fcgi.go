@@ -8,7 +8,8 @@ import (
 	"encoding/binary";
 	"bytes";
 	"runtime";
-)
+	"time";
+);
 
 var (
 	FCGI_REQUEST_COMPLETE =    uint8(0);
@@ -140,13 +141,15 @@ func newFCGIRequest(id uint16, output *net.TCPConn) *FCGIRequest {
 	r.responseStarted = false;
 	r.closeOnEnd = false;
 	r.pump_done = make(chan int);
+	// start the output pumps
+	go r.pump(FCGI_STDOUT, r.stdout);
+	go r.pump(FCGI_STDERR, r.stderr);
 	return r;
 }
 func (req *FCGIRequest) pump(kind uint8, r chan string) {
 	for {
 		b := <-r;
 		bb := newFCGIPacketString(kind, req.id, b ).bytes();
-		// fmt.Printf("pumped: %s\r\n", bb);
 		req._out.Write(bb);
 		if b == "" { break }
 	}
@@ -165,59 +168,49 @@ func (req *FCGIRequest) write(text string) {
 		req.stdout <- text;
 	}
 }
-func ns() (float) {
-	s,ns,_ := os.Time();
-	return (float(s)*1000000.0) + float(ns);
-}
 func (req *FCGIRequest) end(appStatus uint32, protocolStatus uint8) {
 	req.abort();
-	start := ns();
+	// wait for the pumps to drain
 	<-req.pump_done;
 	<-req.pump_done;
-	elapsed := (ns() - start);
-	fmt.Printf("pump wait: %.8f ns\r\n", elapsed);
 	req._out.Write(newFCGIPacket(FCGI_END_REQUEST, req.id, newEndRequest(appStatus, protocolStatus).bytes()).bytes());
-	fmt.Printf("Completed request: %s\r\n", req.params["REQUEST_URI"]);
-	if req.closeOnEnd {
-		fmt.Printf("Closing at server's request.");
-		req._out.Close()
-	}
 }
 func (req *FCGIRequest) handle() {
-	// start the output pumps
-	go req.pump(FCGI_STDOUT, req.stdout);
-	go req.pump(FCGI_STDERR, req.stderr);
 	// this would normally be a call out to some application handler
 	// for now do a minimal wsgi act-alike
-	req.start_response("200 OK", map[string] string { "X-Foo": "Bar", });
+	req.start_response("200 OK", map[string] string { "Connection": "keep-alive", });
+	// fmt.Printf("Request response started: %s in %f ms.\r\n", req.params["REQUEST_URI"], (ms() - start));
 	req.write("Hello, WOrld!");
-	// the req.end() should always be here, it is outside the WSGI spec
+	// fmt.Printf("Request first write: %s in %f ms.\r\n", req.params["REQUEST_URI"], (ms() - start));
+	// the req.end() should always be in here, it is outside the WSGI spec
 	req.end(200, FCGI_REQUEST_COMPLETE);
+	// fmt.Println("FCGIRequest.handle() done.");
 }
 func (req *FCGIRequest) abort() {
 	req.stdout <- "";
 	req.stderr <- "";
 }
-func (req *FCGIRequest) processParams(text []byte) {
 
-	var getOneSize = func (slice []byte) (uint32, []byte) {
-		size := slice[0];
-		r := 1;
-		if size >> 7 == 1 {
-			er := binary.Read(bytes.NewBuffer(slice[0:4]), binary.BigEndian, &size);
-			if er != nil {
-				fmt.Printf("binary.Read error: %s\r\n", er);
-				return 0, slice[len(slice):len(slice)];
-			}
-			r = 4;
+func getOneSize (slice []byte) (uint32, []byte) {
+	size := slice[0];
+	r := 1;
+	if size >> 7 == 1 {
+		er := binary.Read(bytes.NewBuffer(slice[0:4]), binary.BigEndian, &size);
+		if er != nil {
+			fmt.Printf("binary.Read error: %s\r\n", er);
+			return 0, slice[len(slice):len(slice)];
 		}
-		return uint32(size), slice[r:len(slice)];
-	};
-
-	var getOneValue = func (slice []byte, size uint32) (string, []byte) {
-		return string(slice[0:size]), slice[size:len(slice)];
-	};
-
+		r = 4;
+	}
+	return uint32(size), slice[r:len(slice)];
+};
+func getOneValue (slice []byte, size uint32) (string, []byte) {
+	return string(slice[0:size]), slice[size:len(slice)];
+};
+func (req *FCGIRequest) processParams(text []byte) {
+	// FastCGI uses it's own key,value pair encoding
+	// processParams reads an encoded []byte into this
+	// request's params map
 	slice := text[0:len(text)];
 	for len(slice) > 0 {
 		var (
@@ -234,6 +227,46 @@ func (req *FCGIRequest) processParams(text []byte) {
 	}
 }
 
+func handle(rw *net.TCPConn) {
+	requests := map[uint16] *FCGIRequest {};
+	start := int64(0);
+	for {
+		p, err := readFCGIPacket(rw);
+		if err != nil { // EOF is normal error here
+			break;
+		}
+		switch p.hdr.Kind {
+			case FCGI_BEGIN_REQUEST:
+				var h FCGIBeginRequest;
+				start = time.Nanoseconds();
+				binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
+				req := newFCGIRequest(p.hdr.RequestId, rw);
+				req.closeOnEnd = (h.Flags == 0);
+				requests[p.hdr.RequestId] = req;
+			case FCGI_PARAMS:
+				requests[p.hdr.RequestId].processParams(p.content);
+			case FCGI_STDIN:
+				if p.hdr.ContentLength == uint16(0) {
+					// because of a bug, Close() can't happen inside a goroutine other than the one Read()ing it
+					// so once we dispatch the request, no other FCGI records will be processed
+					// this means that multiplexing, and ABORT_REQUEST, will not work (not that any webservers support it now anyway)
+					req := requests[p.hdr.RequestId];
+					req.handle();
+					fmt.Printf("Request complete: %s in %.2f ms.\r\n", req.params["REQUEST_URI"], float64(time.Nanoseconds() - start) * float64(10e-6));
+					if req.closeOnEnd {
+						rw.Close();
+						break;
+					}
+				} else {
+					requests[p.hdr.RequestId].stdin.Write(p.content);
+				}
+			case FCGI_ABORT_REQUEST:
+				requests[p.hdr.RequestId].abort();
+		}
+	}
+	rw.Close();
+}
+
 func listen() os.Error {
 	addr, e := net.ResolveTCPAddr("127.0.0.1:7143");
 	if e != nil { return e }
@@ -242,42 +275,15 @@ func listen() os.Error {
 	fmt.Println("Listening");
 	for {
 		rw, e := s.AcceptTCP();
-		if e != nil { return e }
+		if e != nil {
+			fmt.Printf("Accept error: %s\r\n", e);
+			break;
+		}
 		fmt.Println("Connection accepted");
-		go handle(rw)
+		go handle(rw);
 	}
 	s.Close();
-	return nil
-}
-
-func handle(rw *net.TCPConn) {
-	requests := map[uint16] *FCGIRequest {};
-	for {
-		p, err := readFCGIPacket(rw);
-		if err != nil { // EOF is normal error here
-			return;
-		}
-		// fmt.Printf("hdr: %s\r\n",p.hdr);
-		switch p.hdr.Kind {
-			case FCGI_BEGIN_REQUEST:
-				var h FCGIBeginRequest;
-				binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
-				fmt.Printf("BEGIN: %s\r\n",h);
-				req := newFCGIRequest(p.hdr.RequestId, rw);
-				req.closeOnEnd = (h.Flags == 0);
-				requests[p.hdr.RequestId] = req;
-			case FCGI_PARAMS:
-				requests[p.hdr.RequestId].processParams(p.content);
-			case FCGI_STDIN:
-				if p.hdr.ContentLength == uint16(0) {
-					go requests[p.hdr.RequestId].handle();
-				} else {
-					requests[p.hdr.RequestId].stdin.Write(p.content);
-				}
-			case FCGI_ABORT_REQUEST:
-				requests[p.hdr.RequestId].abort();
-		}
-	}
+	return nil;
 }
 
 func main() int {
@@ -287,6 +293,7 @@ func main() int {
 		fmt.Println("err in main",err.String());
 		return 1;
 	}
+
 	return 0;
 }
 
