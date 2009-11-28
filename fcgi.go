@@ -164,7 +164,7 @@ func (req *Request) end(appStatus uint32, protocolStatus uint8) {
 	<-req.pump_done;
 	req._out.Write(newFCGIPacket(FCGI_END_REQUEST, req.id, newEndRequest(appStatus, protocolStatus).bytes()).bytes());
 	if req.closeOnEnd {
-		fmt.Printf("Server requested close, Close()ing.");
+		// fmt.Printf("Server requested close, Close()ing.");
 		req._out.Close();
 	}
 }
@@ -241,13 +241,14 @@ func fcgi_slave(rw *net.TCPConn, application web_application) {
 				req := newRequest(p.hdr.RequestId, rw);
 				// lighttpd sets this backwards atm: req.closeOnEnd = (h.Flags == 0);
 				req.closeOnEnd = true;
-				fmt.Printf("setting req.closeOnEnd = %s from %d", req.closeOnEnd, h.Flags);
+				// fmt.Printf("setting req.closeOnEnd = %s from %d", req.closeOnEnd, h.Flags);
 				requests[p.hdr.RequestId] = req;
 			case FCGI_PARAMS:
 				requests[p.hdr.RequestId].processParams(p.content);
 			case FCGI_STDIN:
 				if p.hdr.ContentLength == uint16(0) {
-					go requests[p.hdr.RequestId].handle(application);
+					// TODO: once the net.Conn race conditions are fixed, this should be a goroutine
+					requests[p.hdr.RequestId].handle(application);
 				} else {
 					requests[p.hdr.RequestId].stdin.Write(p.content);
 				}
@@ -258,6 +259,11 @@ func fcgi_slave(rw *net.TCPConn, application web_application) {
 	rw.Close();
 }
 
+/** ServeTCP
+*	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
+* addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
+*	application - the callable which will produce the output for each Request.
+**/
 func ServeTCP(addr string, application web_application) os.Error {
 	a, e := net.ResolveTCPAddr(addr);
 	if e != nil { return e }
@@ -277,7 +283,13 @@ func ServeTCP(addr string, application web_application) os.Error {
 	return nil;
 }
 
-func ServeFD() os.Error { // need to find a way to create a socket from a raw fd first
+/** ServeFD
+*	Creates a FastCGI Responder on an already open FD.  This is how one would support being spawned dynamically.
+*	ATM, I don't know how to build a ReadWriter out of a raw fd, so this is here for documentation purposes.
+* fd - the fd to communicate over, typically defined by FCGI_LISTENSOCK_FILENO (0)
+*	application - the callable which will produce the output for each Request.
+**/
+func ServeFD(fd int, application web_application) os.Error { // need to find a way to create a socket from a raw fd first
 	return nil;
 }
 
