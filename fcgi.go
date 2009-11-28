@@ -261,7 +261,7 @@ func fcgi_slave(rw *net.TCPConn, application web_application) {
 
 /** ServeTCP
 *	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
-* addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
+*	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
 *	application - the callable which will produce the output for each Request.
 **/
 func ServeTCP(addr string, application web_application) os.Error {
@@ -286,7 +286,7 @@ func ServeTCP(addr string, application web_application) os.Error {
 /** ServeFD
 *	Creates a FastCGI Responder on an already open FD.  This is how one would support being spawned dynamically.
 *	ATM, I don't know how to build a ReadWriter out of a raw fd, so this is here for documentation purposes.
-* fd - the fd to communicate over, typically defined by FCGI_LISTENSOCK_FILENO (0)
+*	fd - the fd to communicate over, typically defined by FCGI_LISTENSOCK_FILENO (0)
 *	application - the callable which will produce the output for each Request.
 **/
 func ServeFD(fd int, application web_application) os.Error { // need to find a way to create a socket from a raw fd first
