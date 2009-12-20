@@ -10,7 +10,7 @@ import (
 	"time";
 );
 
-var (
+var ( // from fcgi.h
 	FCGI_REQUEST_COMPLETE =    uint8(0);
 	FCGI_BEGIN_REQUEST =       uint8(1);
 	FCGI_ABORT_REQUEST =       uint8(2);
@@ -25,6 +25,9 @@ var (
 	FCGI_UNKNOWN_TYPE =       uint8(11);
 	FCGI_MAXTYPE = (FCGI_UNKNOWN_TYPE);
 );
+
+/* The type for a callable that handles requests */
+type Handler func( *Request );
 
 type FCGIHeader struct {
 	Version uint8;
@@ -62,7 +65,7 @@ func readFCGIPacket(r io.Reader) (*FCGIPacket, os.Error) {
 		return nil, err;
 	}
 	p.hdr = hdr;
-	if p.hdr.ContentLength > 0 { 
+	if p.hdr.ContentLength > 0 {
 		p.content = make([]byte, p.hdr.ContentLength + uint16(p.hdr.PaddingLength));
 		_, er := r.Read(p.content);
 		p.content = p.content[0:p.hdr.ContentLength]; // leave the padding bytes sitting in memory?
@@ -110,18 +113,21 @@ func newEndRequest(appStatus uint32, protocolStatus uint8) (*FCGIEndRequest) {
 	er.protocolStatus = protocolStatus;
 	return er;
 }
-func (er *FCGIEndRequest) bytes() ([]byte) {
+func (self *FCGIEndRequest) bytes() ([]byte) {
 	buf := make([]byte, 8);
-	binary.BigEndian.PutUint32(buf, er.appStatus);
-	buf[4] = er.protocolStatus;
+	binary.BigEndian.PutUint32(buf, self.appStatus);
+	buf[4] = self.protocolStatus;
 	return buf;
 }
 
 type Request struct {
 	id uint16;
-	_out *net.TCPConn;
-	params map[string] string;
+	_out io.WriteCloser;
+	params map[string] string; // from the request
+	headers map[string] string; // for the response
+	status string; // for the response
 	stdin *bytes.Buffer;
+	data *bytes.Buffer;
 	stdout chan string;
 	stderr chan string;
 	responseStarted bool;
@@ -129,16 +135,18 @@ type Request struct {
 	closeOnEnd bool;
 	pump_done chan int; // for signalling when a pump goroutine dies
 }
-type web_application func( *Request, func(string, map[string] string));
 
-func newRequest(id uint16, output *net.TCPConn) *Request {
+
+func newRequest(id uint16, output io.WriteCloser) *Request {
 	r := new(Request);
 	r.id = id;
 	r._out = output;
 	r.params = map[string]string {};
+	r.headers = map[string]string {};
 	r.stdin = bytes.NewBuffer(make([]byte,0));
-	r.stdout = make(chan string);
-	r.stderr = make(chan string);
+	r.data = bytes.NewBuffer(make([]byte,0));
+	r.stdout = make(chan string, 1024);
+	r.stderr = make(chan string, 16);
 	r.responseStarted = false;
 	r.closeOnEnd = false;
 	r.startTime = time.Nanoseconds();
@@ -148,43 +156,65 @@ func newRequest(id uint16, output *net.TCPConn) *Request {
 	go r.pump(FCGI_STDERR, r.stderr);
 	return r;
 }
+/* Public Request Methods */
+func (req *Request) Status(status string) {
+	if ! req.responseStarted {
+		req.status = status;
+	}
+}
+func (req *Request) Header(str string, val string) {
+	if ! req.responseStarted {
+		req.headers[str] = val;
+	}
+}
+func (req *Request) Error(str string) {
+	if ! req.responseStarted {
+		req.startResponse("500 Application Error", req.headers);
+	}
+	req.stderr <- str;
+}
+func (req *Request) Write(str string) {
+	if ! req.responseStarted {
+		req.startResponse(req.status, req.headers);
+	}
+	req.stdout <- str;
+}
+/* private Request methods */
 func (req *Request) pump(kind uint8, r chan string) {
-	for {
-		b := <-r;
-		bb := newFCGIPacketString(kind, req.id, b ).bytes();
-		req._out.Write(bb);
-		if b == "" { break }
+	for { // this method reads strings from r
+		// and outputs the bytes of a FCGIPacket
+		s := <-r;
+		b := newFCGIPacketString(kind, req.id, s ).bytes();
+		req._out.Write(b);
+		if s == "" { break }
 	}
 	req.pump_done <- 1;
 }
 func (req *Request) end(appStatus uint32, protocolStatus uint8) {
+	// send the done messages
 	req.abort();
 	// wait for the pumps to drain
 	<-req.pump_done;
 	<-req.pump_done;
+	// write the final packet
 	req._out.Write(newFCGIPacket(FCGI_END_REQUEST, req.id, newEndRequest(appStatus, protocolStatus).bytes()).bytes());
+	// if the webserver requested that we close this connection
 	if req.closeOnEnd {
-		// fmt.Printf("Server requested close, Close()ing.");
+		// then close it
 		req._out.Close();
 	}
 }
-func (req *Request) Write(str string) {
-	if req.responseStarted {
-		req.stdout <- str;
+func (req *Request) startResponse(status string, headers map[string] string ) {
+	req.stdout <- "Status: "+status+"\r\n";
+	for key, val := range headers {
+		req.stdout <- key + ": " + val + "\r\n";
 	}
+	req.stdout <- "\r\n";
+	req.responseStarted = true;
 }
-func (req *Request) handle(application web_application) { // dispatch similar to wsgi
-	start_response := func (status string, headers map[string] string ) {
-		req.stdout <- "Status: "+status+"\r\n";
-		for key, val := range headers {
-			req.stdout <- key + ": " + val + "\r\n";
-		}
-		req.stdout <- "\r\n";
-		req.responseStarted = true;
-	};
-	application(req, start_response);
+func (req *Request) handle(application Handler) {
+	application(req);
 	req.end(200, FCGI_REQUEST_COMPLETE);
-	fmt.Printf("Request complete: %s in %.2f ms.\r\n", req.params["REQUEST_URI"], float64(time.Nanoseconds() - req.startTime) * float64(10e-6));
 }
 func (req *Request) abort() {
 	req.stdout <- "";
@@ -227,19 +257,22 @@ func (req *Request) processParams(text []byte) {
 	}
 }
 
-func fcgi_slave(rw *net.TCPConn, application web_application) {
+func fcgi_slave(rw io.ReadWriteCloser, pool chan *Request, application Handler) {
 	requests := map[uint16] *Request {};
 	for {
-		p, err := readFCGIPacket(rw);
+		p, err := readFCGIPacket(io.Reader(rw));
 		if err != nil { // EOF is normal error here
 			break;
 		}
 		switch p.hdr.Kind {
 			case FCGI_BEGIN_REQUEST:
-				var h FCGIBeginRequest;
-				binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
-				req := newRequest(p.hdr.RequestId, rw);
-				// lighttpd sets this backwards atm: req.closeOnEnd = (h.Flags == 0);
+				// TODO: since we dont read the real closeOnEnd flag down below, we can skip reading the content
+				// var h FCGIBeginRequest;
+				// binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
+				req := newRequest(p.hdr.RequestId, io.WriteCloser(rw));
+				// lighttpd sets this backwards atm, so we cant user the real value: 
+				// req.closeOnEnd = (h.Flags == 0);
+				// TODO: find a webserver that supports multiplexed fastcgi
 				req.closeOnEnd = true;
 				// fmt.Printf("setting req.closeOnEnd = %s from %d", req.closeOnEnd, h.Flags);
 				requests[p.hdr.RequestId] = req;
@@ -247,10 +280,19 @@ func fcgi_slave(rw *net.TCPConn, application web_application) {
 				requests[p.hdr.RequestId].processParams(p.content);
 			case FCGI_STDIN:
 				if p.hdr.ContentLength == uint16(0) {
-					// TODO: once the net.Conn race conditions are fixed, this should be a goroutine
-					requests[p.hdr.RequestId].handle(application);
+					// there are two ways this can be done here
+					// 1) put the request into a pool of workers
+					pool <- requests[p.hdr.RequestId];
+					// or 2) call the handler directly
+					// e.g., requests[p.hdr.RequestId].handle(application);
+					// or 2a) call the handler as a goroutine
+					// only 1) and 2a) would support multiplexing
 				} else {
 					requests[p.hdr.RequestId].stdin.Write(p.content);
+				}
+			case FCGI_DATA:
+				if p.hdr.ContentLength > uint16(0) {
+					requests[p.hdr.RequestId].data.Write(p.content);
 				}
 			case FCGI_ABORT_REQUEST:
 				requests[p.hdr.RequestId].abort();
@@ -259,25 +301,54 @@ func fcgi_slave(rw *net.TCPConn, application web_application) {
 	rw.Close();
 }
 
+func worker (id int, workchan chan *Request, workdone chan int, application Handler) {
+	// each worker continually
+	for {
+		// reads from their work channel
+		req := <-workchan;
+		// breaks on a close signal (a nil value)
+		if req == nil { break; }
+		// handles the request
+		req.handle(application);
+		fmt.Printf("Worker %d completed: %s in %.2f ms.\r\n", id, req.params["REQUEST_URI"], float64(time.Nanoseconds() - req.startTime) * float64(10e-6));
+	}
+	fmt.Printf("Worker %d exiting\r\n", id);
+	// when finished, notify
+	workdone <-1
+};
+
 /** ServeTCP
 *	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
 *	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
 *	application - the callable which will produce the output for each Request.
 **/
-func ServeTCP(addr string, application web_application) os.Error {
+func ServeTCP(addr string, application Handler, pool_size int) os.Error {
 	a, e := net.ResolveTCPAddr(addr);
 	if e != nil { return e }
 	s, e := net.ListenTCP("tcp4", a);
 	if e != nil { return e }
 	fmt.Println("Listening");
+	fmt.Println("Starting goroutine workers...");
+	workchan := make(chan *Request, pool_size);
+	workdone := make(chan int);
+	for i := 0; i < pool_size; i++ {
+		// spawn a worker goroutine into the pool
+		go worker(i, workchan, workdone, application);
+	}
+
 	for {
 		rw, e := s.AcceptTCP();
 		if e != nil {
 			fmt.Printf("Accept error: %s\r\n", e);
 			break;
 		}
-		fmt.Println("Connection accepted");
-		go fcgi_slave(rw, application);
+		// fmt.Println("Connection accepted");
+		go fcgi_slave(io.ReadWriteCloser(rw), workchan, application);
+	}
+
+	for i := 0; i < pool_size; i++ {
+		workchan <- nil; // send a close signal
+		<-workdone; // wait for ack
 	}
 	s.Close();
 	return nil;
@@ -289,7 +360,7 @@ func ServeTCP(addr string, application web_application) os.Error {
 *	fd - the fd to communicate over, typically defined by FCGI_LISTENSOCK_FILENO (0)
 *	application - the callable which will produce the output for each Request.
 **/
-func ServeFD(fd int, application web_application) os.Error { // need to find a way to create a socket from a raw fd first
+func ServeFD(fd int, application Handler) os.Error { // need to find a way to create a socket from a raw fd first
 	return nil;
 }
 
