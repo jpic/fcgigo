@@ -1,17 +1,18 @@
 /* This is a test program suitable for being launched by a webserver.
  * Example lighttpd config:
 fastcgi.server =("" =>
-									("" =>
-										(
-  "bin-path" => "/opt/go/code/fcgi/test_dyn.out",
-											"port" => 7134,
-											"check-local" => "disable",
-											"max-procs" => 1,
-										),
-									)
+  ("" =>
+    (
+      "bin-path" => "/opt/go/code/fcgi/test_dyn.out",
+      "port" => 7134,
+      "check-local" => "disable",
+      "max-procs" => 3,
+    ),
+  )
 )
-*/
 
+When lighttpd starts with this config, it will automatically invoke and communicate with this program.
+*/
 package main
 
 import (

@@ -1,13 +1,13 @@
 /* This is test program that launches a stand-alone FastCGI Responder, listening on a TCP port.
  * Example lighttpd configuration:
 fastcgi.server =("" =>
-									("" =>
-										(
-											"host" => "127.0.0.1",
-											"port" => 7134,
-											"check-local" => "disable",
-										),
-									)
+  ("" =>
+    (
+      "host" => "127.0.0.1",
+      "port" => 7134,
+      "check-local" => "disable",
+    ),
+  )
 )
 
 Then, you are responsible for starting this process (external to the webserver).
