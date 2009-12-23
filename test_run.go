@@ -1,3 +1,17 @@
+/* This is a test program suitable for being launched by a webserver.
+ * Example lighttpd config:
+fastcgi.server =("" =>
+									("" =>
+										(
+  "bin-path" => "/opt/go/code/fcgi/test_dyn.out",
+											"port" => 7134,
+											"check-local" => "disable",
+											"max-procs" => 1,
+										),
+									)
+)
+*/
+
 package main
 
 import (
@@ -5,7 +19,6 @@ import (
 	"runtime";
 	"fcgi";
 	"os";
-	// "time";
 );
 
 func hello_application(req *fcgi.Request ) {
@@ -15,7 +28,6 @@ func hello_application(req *fcgi.Request ) {
 }
 
 func main() int {
-	fcgi.Log("main starting\r\n");
 	runtime.GOMAXPROCS(4);
 	err := fcgi.Run(hello_application, 10);
 	if err != nil {

@@ -26,24 +26,64 @@ import (
 	"syscall";
 );
 
-var ( // from fcgi.h
-	FCGI_REQUEST_COMPLETE =    uint8(0);
-	FCGI_BEGIN_REQUEST =       uint8(1);
-	FCGI_ABORT_REQUEST =       uint8(2);
-	FCGI_END_REQUEST =         uint8(3);
-	FCGI_PARAMS =              uint8(4);
-	FCGI_STDIN =               uint8(5);
-	FCGI_STDOUT =              uint8(6);
-	FCGI_STDERR =              uint8(7);
-	FCGI_DATA =                uint8(8);
-	FCGI_GET_VALUES =          uint8(9);
-	FCGI_GET_VALUES_RESULT =  uint8(10);
-	FCGI_UNKNOWN_TYPE =       uint8(11);
-	FCGI_MAXTYPE = (FCGI_UNKNOWN_TYPE);
-);
-
 /* The type for a callable that handles requests */
 type Handler func( *Request );
+
+/** Run
+* When launched by a webserver, Run() will accept new connections on stdin.
+* (this is the standard way from the spec)
+* e.g. A minimal responder:
+* fcgi.Run(func (req *fcgi.Request) {
+		req.Status("200 OK");
+		req.Write("Hello World");
+	});
+* See RunTCP() for how to spawn a process yourself that listens on a TCP socket.
+* Arguments:
+*	application - the callable which will produce the output for each Request.
+* pool_size - the number of goroutines to spawn into a worker pool for processing requests
+**/
+func Run(application Handler, pool_size int) os.Error {
+	pool := newWorkerPool(pool_size, application);
+	for {
+		nfd, _, err := syscall.Accept(0);
+		// Log(fmt.Sprintf("Accept: nfd: %d addr:%s err:%s\r\n",nfd,addr,err));
+		if err != 0 {
+			Log(fmt.Sprintf("Accept Error: %d\r\n", err))
+			break;
+		}
+		go fcgi_slave(io.ReadWriteCloser(os.NewFile(nfd, "<noname>")), pool);
+	}
+	pool.stopAllWorkers();
+	return nil;
+}
+
+/** RunTCP
+*	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
+* (even though the spec doesn't mention this, it's how you would do a big cluster of remote listeners)
+* Arguments:
+*	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
+*	application - the callable which will produce the output for each Request.
+* pool_size - the number of goroutines to spawn into a worker pool for processing requests
+**/
+func RunTCP(addr string, application Handler, pool_size int) os.Error {
+	a, e := net.ResolveTCPAddr(addr);
+	if e != nil { return e }
+	s, e := net.ListenTCP("tcp4", a);
+	if e != nil { return e }
+	Log(fmt.Sprint("Listening\r\n"));
+	pool := newWorkerPool(pool_size, application);
+	for {
+		rw, e := s.AcceptTCP();
+		if e != nil {
+			Log(fmt.Sprintf("Accept error: %s\r\n", e));
+			break;
+		}
+		go fcgi_slave(io.ReadWriteCloser(rw), pool);
+	}
+	pool.stopAllWorkers();
+	s.Close();
+	return nil;
+}
 
 /* The basic Request object for a FastCGI Request */
 type Request struct {
@@ -199,7 +239,110 @@ func (req *Request) processParams(text []byte) {
 	}
 }
 
+/* this is the handler that reads actual FCGI packets off the wire, and dispatches them to the proper request */
+func fcgi_slave(rw io.ReadWriteCloser, pool *WorkerPool){ // chan *Request, application Handler) {
+	requests := map[uint16] *Request {};
+	for {
+		p, err := readFCGIPacket(io.Reader(rw));
+		if err == os.EOF {
+			break;
+		} else if err != nil {
+			os.Stderr.WriteString(err.String()+"\r\n");
+		}
+		switch p.hdr.Kind {
+			case FCGI_BEGIN_REQUEST:
+				// TODO: since we dont read the real closeOnEnd flag down below, we can skip reading the content
+				// var h FCGIBeginRequest;
+				// binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
+				req := newRequest(p.hdr.RequestId, io.WriteCloser(rw));
+				// lighttpd sets this backwards atm, so we cant use the real value: 
+				// req.closeOnEnd = (h.Flags == 0);
+				// TODO: find a webserver that supports multiplexed fastcgi
+				req.closeOnEnd = true;
+				// fmt.Printf("setting req.closeOnEnd = %s from %d", req.closeOnEnd, h.Flags);
+				requests[p.hdr.RequestId] = req;
+			case FCGI_PARAMS:
+				requests[p.hdr.RequestId].processParams(p.content);
+			case FCGI_STDIN:
+				if p.hdr.ContentLength == uint16(0) {
+					// send the request into the worker pool
+					pool.assignWork(requests[p.hdr.RequestId]);
+				} else {
+					requests[p.hdr.RequestId].stdin.Write(p.content);
+				}
+			case FCGI_DATA:
+				if p.hdr.ContentLength > uint16(0) {
+					requests[p.hdr.RequestId].data.Write(p.content);
+				}
+			case FCGI_ABORT_REQUEST:
+				requests[p.hdr.RequestId].abort();
+		}
+	}
+	rw.Close();
+}
+
+
+/* Worker Pool Definitions */
+type WorkerPool struct {
+	ch chan *Request;
+	done chan int;
+	n int;
+}
+func newWorkerPool(pool_size int, h Handler ) (*WorkerPool) {
+	p := &WorkerPool {
+		ch: make(chan *Request, pool_size),
+		done: make(chan int),
+		n: pool_size,
+	};
+	Log(fmt.Sprintf("Starting worker pool (%d)", pool_size));
+	for i := 0; i < pool_size; i++ {
+		// spawn a worker goroutine into the pool
+		go p.worker(i, h);
+	}
+	return p;
+}
+func (self *WorkerPool) assignWork(req *Request) {
+	self.ch <- req;
+}
+func (self *WorkerPool) stopAllWorkers() {
+	for i := 0; i < self.n; i++ {
+		self.ch <- nil; // send a close signal
+		<-self.done; // wait for ack
+	}
+}
+func (self *WorkerPool) worker(id int, application Handler) {
+	// each worker continually
+	for {
+		// reads from their work channel
+		req := <-self.ch;
+		// breaks on a close signal (a nil value)
+		if req == nil { break; }
+		// handles the request
+		req.handle(application);
+		Log(fmt.Sprintf("Worker %d completed: %s in %.2f ms.\r\n", id, req.env["REQUEST_URI"], float64(time.Nanoseconds() - req.startTime) * float64(10e-6)));
+	}
+	Log(fmt.Sprintf("Worker %d exiting\r\n", id));
+	// when finished, notify
+	self.done <-1
+};
+
 /* The protocol details: */
+
+var ( // from fcgi.h
+	FCGI_REQUEST_COMPLETE =    uint8(0);
+	FCGI_BEGIN_REQUEST =       uint8(1);
+	FCGI_ABORT_REQUEST =       uint8(2);
+	FCGI_END_REQUEST =         uint8(3);
+	FCGI_PARAMS =              uint8(4);
+	FCGI_STDIN =               uint8(5);
+	FCGI_STDOUT =              uint8(6);
+	FCGI_STDERR =              uint8(7);
+	FCGI_DATA =                uint8(8);
+	FCGI_GET_VALUES =          uint8(9);
+	FCGI_GET_VALUES_RESULT =  uint8(10);
+	FCGI_UNKNOWN_TYPE =       uint8(11);
+	FCGI_MAXTYPE = (FCGI_UNKNOWN_TYPE);
+);
 type FCGIHeader struct {
 	Version uint8;
 	Kind uint8;
@@ -297,149 +440,6 @@ func (self *FCGIEndRequest) bytes() ([]byte) {
 	buf[4] = self.protocolStatus;
 	return buf;
 }
-
-
-/* this is the handler that reads actual FCGI packets off the wire, and dispatches them to the proper request */
-func fcgi_slave(rw io.ReadWriteCloser, pool *WorkerPool){ // chan *Request, application Handler) {
-	requests := map[uint16] *Request {};
-	for {
-		p, err := readFCGIPacket(io.Reader(rw));
-		if err == os.EOF {
-			break;
-		} else if err != nil {
-			os.Stderr.WriteString(err.String()+"\r\n");
-		}
-		switch p.hdr.Kind {
-			case FCGI_BEGIN_REQUEST:
-				// TODO: since we dont read the real closeOnEnd flag down below, we can skip reading the content
-				// var h FCGIBeginRequest;
-				// binary.Read(bytes.NewBuffer(p.content), binary.BigEndian, &h);
-				req := newRequest(p.hdr.RequestId, io.WriteCloser(rw));
-				// lighttpd sets this backwards atm, so we cant use the real value: 
-				// req.closeOnEnd = (h.Flags == 0);
-				// TODO: find a webserver that supports multiplexed fastcgi
-				req.closeOnEnd = true;
-				// fmt.Printf("setting req.closeOnEnd = %s from %d", req.closeOnEnd, h.Flags);
-				requests[p.hdr.RequestId] = req;
-			case FCGI_PARAMS:
-				requests[p.hdr.RequestId].processParams(p.content);
-			case FCGI_STDIN:
-				if p.hdr.ContentLength == uint16(0) {
-					// send the request into the worker pool
-					pool.assignWork(requests[p.hdr.RequestId]);
-				} else {
-					requests[p.hdr.RequestId].stdin.Write(p.content);
-				}
-			case FCGI_DATA:
-				if p.hdr.ContentLength > uint16(0) {
-					requests[p.hdr.RequestId].data.Write(p.content);
-				}
-			case FCGI_ABORT_REQUEST:
-				requests[p.hdr.RequestId].abort();
-		}
-	}
-	rw.Close();
-}
-
-/* Worker Pool Definitions */
-type WorkerPool struct {
-	ch chan *Request;
-	done chan int;
-	n int;
-}
-func newWorkerPool(pool_size int, h Handler ) (*WorkerPool) {
-	p := &WorkerPool {
-		ch: make(chan *Request, pool_size),
-		done: make(chan int),
-		n: pool_size,
-	};
-	Log(fmt.Sprintf("Starting worker pool (%d)", pool_size));
-	for i := 0; i < pool_size; i++ {
-		// spawn a worker goroutine into the pool
-		go p.worker(i, h);
-	}
-	return p;
-}
-func (self *WorkerPool) assignWork(req *Request) {
-	self.ch <- req;
-}
-func (self *WorkerPool) stopAllWorkers() {
-	for i := 0; i < self.n; i++ {
-		self.ch <- nil; // send a close signal
-		<-self.done; // wait for ack
-	}
-}
-func (self *WorkerPool) worker(id int, application Handler) {
-	// each worker continually
-	for {
-		// reads from their work channel
-		req := <-self.ch;
-		// breaks on a close signal (a nil value)
-		if req == nil { break; }
-		// handles the request
-		req.handle(application);
-		Log(fmt.Sprintf("Worker %d completed: %s in %.2f ms.\r\n", id, req.env["REQUEST_URI"], float64(time.Nanoseconds() - req.startTime) * float64(10e-6)));
-	}
-	Log(fmt.Sprintf("Worker %d exiting\r\n", id));
-	// when finished, notify
-	self.done <-1
-};
-
-
-
-/** Run
-* When launched by a webserver, this is what you would use.
-* e.g. A minimal responder:
-* fcgi.Run(func (req *fcgi.Request) {
-		req.Status("200 OK");
-		req.Write("Hello World");
-	});
-* See RunTCP() for how to spawn a process yourself that listens on a TCP socket.
-* Arguments:
-*	application - the callable which will produce the output for each Request.
-* pool_size - the number of goroutines to spawn into a worker pool for processing requests
-**/
-func Run(application Handler, pool_size int) os.Error {
-	pool := newWorkerPool(pool_size, application);
-	for {
-		nfd, _, err := syscall.Accept(0);
-		// Log(fmt.Sprintf("Accept: nfd: %d addr:%s err:%s\r\n",nfd,addr,err));
-		if err != 0 {
-			Log(fmt.Sprintf("Accept Error: %d\r\n", err))
-			break;
-		}
-		go fcgi_slave(io.ReadWriteCloser(os.NewFile(nfd, "<noname>")), pool);
-	}
-	pool.stopAllWorkers();
-	return nil;
-}
-
-/** RunTCP
-*	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
-*	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
-*	application - the callable which will produce the output for each Request.
-* pool_size - the number of goroutines to spawn into a worker pool for processing requests
-**/
-func RunTCP(addr string, application Handler, pool_size int) os.Error {
-	a, e := net.ResolveTCPAddr(addr);
-	if e != nil { return e }
-	s, e := net.ListenTCP("tcp4", a);
-	if e != nil { return e }
-	Log(fmt.Sprint("Listening\r\n"));
-	pool := newWorkerPool(pool_size, application);
-	for {
-		rw, e := s.AcceptTCP();
-		if e != nil {
-			Log(fmt.Sprintf("Accept error: %s\r\n", e));
-			break;
-		}
-		go fcgi_slave(io.ReadWriteCloser(rw), pool);
-	}
-	pool.stopAllWorkers();
-	s.Close();
-	return nil;
-}
-
 /* some util stuff */
 func Log(msg string) {
 	f, err := os.Open("fcgi.log", os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0666);
