@@ -4,6 +4,7 @@ import (
 	"fmt";
 	"runtime";
 	"fcgi";
+	"os";
 	// "time";
 );
 
@@ -14,13 +15,13 @@ func hello_application(req *fcgi.Request ) {
 }
 
 func main() int {
+	fcgi.Log("main starting\r\n");
 	runtime.GOMAXPROCS(4);
-	err := fcgi.ServeTCP("127.0.0.1:7143", hello_application, 100);
+	err := fcgi.Run(hello_application, 10);
 	if err != nil {
-		fmt.Println("err in main",err.String());
+		os.Stderr.WriteString(fmt.Sprintf("err in main: %s",err.String()));
 		return 1;
 	}
-
 	return 0;
 }
 
