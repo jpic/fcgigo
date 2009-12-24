@@ -1,17 +1,18 @@
-/* fcgigo is a FastCGI implementation in pure Go.
-Minimal example:
-fcgi.Run(func (req *fcgi.Request) {
-	req.Status("200 OK");
-	req.Write("Hello World");
-}, 100);
- 
-The above example would result in a program that can be launched by the webserver.
-Or, to spawn an external process that listens on a TCP port:
-fcgi.RunTCP("localhost:7143", func (req *fcgi.Request) {
-	req.Status("200 OK");
-	req.Write("Hello World");
-}, 100);
-*/
+/** fcgigo is a FastCGI implementation in pure Go.
+ * Minimal example:
+ * fcgi.Run(func (req *fcgi.Request) {
+ *	req.Status("200 OK");
+ *	req.Write("Hello World");
+ * }, 100);
+ *
+ * The above example would result in a program that can be launched by the webserver.
+ *
+ * Or, to spawn an external process that listens on a TCP port:
+ * fcgi.RunTCP("localhost:7143", func (req *fcgi.Request) {
+ *	req.Status("200 OK");
+ *	req.Write("Hello World");
+ * }, 100);
+ **/
 package fcgi
 
 import (
@@ -29,18 +30,12 @@ import (
 type Handler func(*Request)
 
 /** Run
-* When launched by a webserver, Run() will accept new connections on stdin.
-* (this is the standard way from the spec)
-* e.g. A minimal responder:
-fcgi.Run(func (req *fcgi.Request) {
-	req.Status("200 OK");
-	req.Write("Hello World");
-});
-* See RunTCP() for how to spawn a process yourself that listens on a TCP socket.
-* Arguments:
-*	application - the callable which will produce the output for each Request.
-* pool_size - the number of goroutines to spawn into a worker pool for processing requests
-**/
+ * When launched by a webserver, Run() will accept new connections on stdin.
+ * (this is the standard way from the spec)
+ * Arguments:
+ *	application - the callable which will produce the output for each Request.
+ *	pool_size - the number of goroutines to spawn into a worker pool for processing requests
+ **/
 func Run(application Handler, pool_size int) os.Error {
 	pool := newWorkerPool(pool_size, application)
 	for {
@@ -57,13 +52,13 @@ func Run(application Handler, pool_size int) os.Error {
 }
 
 /** RunTCP
-*	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
-* (even though the spec doesn't mention this, it's how you would do a big cluster of remote listeners)
-* Arguments:
-*	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
-*	application - the callable which will produce the output for each Request.
-* pool_size - the number of goroutines to spawn into a worker pool for processing requests
-**/
+ *	Creates a FastCGI Responder that listens on the supplied address.  This functions runs forever.
+ * (even though the spec doesn't mention this, it's how you would do a big cluster of remote listeners)
+ * Arguments:
+ *	addr - a string like "localhost:1234", or "0.0.0.0:999", that specifies a local interface to listen on.
+ *	application - the callable which will produce the output for each Request.
+ *	pool_size - the number of goroutines to spawn into a worker pool for processing requests
+ **/
 func RunTCP(addr string, application Handler, pool_size int) os.Error {
 	a, e := net.ResolveTCPAddr(addr)
 	if e != nil {
