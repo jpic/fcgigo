@@ -36,10 +36,13 @@ import (
 /* Handler is the type for a callable that handles requests. */
 type Handler func(*Request)
 
-/* The basic Request object for a FastCGI Request */
+/* The basic FastCGI Request object */
 type Request struct {
 	// embed all the fields and methods of http.Request
 	*http.Request
+
+	// also, a response
+	*http.Response
 
 	// Data reads the FCGI_DATA channel from the webserver. (for file uploads I think?)
 	Data io.Reader
@@ -55,9 +58,9 @@ type Request struct {
 	env map[string]string // HTTP_* values are parsed out, canonicalized, and stored in .Header
 
 	// for the response
-	headers    map[string]string
-	status     string
-	statusCode int
+	// headers    map[string]string
+	// status     string
+	// statusCode int
 
 	// book-keeping
 	responseStarted bool
@@ -120,72 +123,40 @@ func RunTCP(addr string, application Handler, pool_size int) os.Error {
 /* Sets the response status. */
 func (req *Request) SetStatus(status string) {
 	if !req.responseStarted {
-		req.status = status
-		req.statusCode, _, _ = atoi(status, 0)
+		req.Response.Status = status
+		req.Response.StatusCode, _, _ = atoi(status, 0)
 	}
 }
 
 /* Sets a response header. */
 func (req *Request) SetHeader(str string, val string) {
 	if !req.responseStarted {
-		req.headers[str] = val
+		req.Response.Header[str] = val
 	}
+}
+
+/* Gets a request header. */
+func (req *Request) GetHeader(name string) (string, bool) {
+	ret, ok := req.Request.Header[name]
+	return ret, ok
 }
 
 /* Error(msg) sends text over the FCGI_STDERR channel to the webserver. */
 func (req *Request) Error(str string) {
 	if !req.responseStarted {
-		req.startResponse("500 Application Error", req.headers)
+		req.startResponse("500 Application Error", req.Response.Header)
 	}
 	req.fcgi_write(FCGI_STDERR, str)
+	// TODO: req.fcgi_write(FCGI_STDOUT, <error output html>)
 }
 
 /* Write(msg) sends text over the FCGI_STDOUT channel to the webserver. */
 func (req *Request) Write(str string) {
 	if !req.responseStarted {
-		req.startResponse(req.status, req.headers)
+		req.startResponse(req.Response.Status, req.Response.Header)
 	}
 	req.fcgi_write(FCGI_STDOUT, str)
 }
-
-/* Get a Form value by name. Parses the URL and Body if necessary.
-Let the http.Request level stuff do this.
-func (req *Request) Form(key string) ([]string,bool) {
-	if req.form == nil {
-		req.form = map[string]*vector.StringVector{}
-		body, err := ioutil.ReadAll(req.Body)
-		if err != nil {
-			body = make([]byte,0)
-		}
-		url,ok := req.env["QUERY_STRING"]
-		if ok {
-			url = url + string(body)
-			// Log("Parsing: '"+url)
-			for _, pair := range strings.Split(url, "&", 0) {
-				if len(pair) < 3 { continue; }
-				i := strings.Index(pair, "=")
-				if i > 0 {
-					k := pair[0:i]
-					v := pair[i+1:]
-					// Log("Key: %s Val: %s", k, v));
-					if _, ok = req.form[k]; ! ok {
-						req.form[k] = &vector.StringVector{}
-					}
-					req.form[k].Push(v)
-				}
-			}
-		}
-	}
-	Log("Done parsing form.")
-	ret, ok := req.form[key]
-	Log("Form[%s] was found?:%s",key,ok)
-	defer Log("After return of Form()")
-	if ok {
-		return ret.Data(), true
-	}
-	return nil, false
-}
-*/
 
 /* Private Request methods */
 func newRequest(id uint16, output io.WriteCloser) *Request {
@@ -206,14 +177,20 @@ func newRequest(id uint16, output io.WriteCloser) *Request {
 			Host: "",
 			Referer: "",
 			UserAgent: "",
-			Form: map[string][]string{},
+			Form: nil,
 		},
+		Response: &http.Response{
+			Status: "200 OK",
+			StatusCode: 200,
+			Header: map[string]string{},
+		},
+		// the fastcgi requestId
 		id: id,
-		// to be filled in as packets arrive
-		env: map[string]string{}, // the raw params sent over FCGI
+		// the raw environment sent over FCGI
+		env: map[string]string{},
+		// the private buffers to write to
 		stdin: stdin,
 		data: data,
-		headers: map[string]string{}, // response headers
 		// book-keeping
 		responseStarted: false,
 		startTime: start,
@@ -278,10 +255,13 @@ func (req *Request) handle(application Handler) {
 	if agent, ok := req.env["HTTP_USER_AGENT"]; ok {
 		req.UserAgent = agent
 	}
+
 	// make sure req.Form[] is built
 	req.ParseForm()
+
 	// call the application
 	application(req)
+
 	// end the FCGI request
 	req.end(200, FCGI_REQUEST_COMPLETE)
 }
@@ -345,7 +325,7 @@ func (req *Request) processParams(text []byte) {
 		req.env[key] = val
 		// Log("Param: %s val: %s", key, val)
 		if strings.HasPrefix(key, "HTTP_") {
-			req.Header[standardCase(strings.Bytes(key)[5:])] = val
+			req.Request.Header[standardCase(strings.Bytes(key)[5:])] = val
 		}
 	}
 }
@@ -391,16 +371,17 @@ func handleConnection(rw io.ReadWriteCloser, pool *WorkerPool) {
 				// TODO: can we do this a step earlier, so that the stdin Reader blocks until these packets arrive?
 				pool.assignWork(req) // send the request into the worker pool
 			} else {
+				Log("STDIN: %s", p.content)
 				req.stdin.Write(p.content)
 			}
 		case FCGI_DATA:
-			// Log("FCGI_DATA")
+			Log("FCGI_DATA")
 			if p.hdr.ContentLength > uint16(0) {
 				req.data.Write(p.content)
 			}
 		case FCGI_ABORT_REQUEST:
 			Log("ABORT_REQUEST recieved")
-			requests[p.hdr.RequestId].abort()
+			req.abort()
 		default:
 			Log("Unknown packet header type: %d", p.hdr.Kind)
 		}
