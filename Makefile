@@ -1,11 +1,12 @@
+include $(GOROOT)/src/Make.$(GOARCH)
 
-all: fcgi.a test_tcp.out test_run.out test_arc.out
+TARG=fcgi
+GOFILES=\
+	fcgi.go\
+	server.go\
 
-%.8: %.go
-	8g -I . $<
+include $(GOROOT)/src/Make.pkg
 
-%.out: %.8 fcgi.a
-	8l -o $@ $<
+fmt:
+	gofmt -w *.go
 
-%.a: %.8
-	gopack grc $@ $<
