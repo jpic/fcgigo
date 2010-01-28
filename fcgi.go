@@ -19,39 +19,8 @@ import (
 )
 
 /* Handler is the type for a callable that handles requests. */
-type Handler func(*Request)
+type FcgiRequestHandler func(*Request)
 
-/* The basic FastCGI Request object */
-type Request struct {
-	// embed all the fields and methods of http.Request
-	*http.Request
-
-	// also, a response
-	*http.Response
-
-	// Data reads the FCGI_DATA channel from the webserver. (for file uploads I think?)
-	Data io.Reader
-	data *bytes.Buffer // the private buffer behind Data
-
-	// the requestId from the FCGI protocol
-	id uint16
-
-	// as FCGI_STDIN packets arrive, they go here
-	stdin *bytes.Buffer // read by .Body
-
-	// as FCGI_PARAM packets arrive, they go here in raw form
-	env map[string]string // HTTP_* values are parsed out, canonicalized, and stored in .Header
-
-	// for the response
-	// headers    map[string]string
-	// status     string
-	// statusCode int
-
-	// book-keeping
-	responseStarted bool
-	startTime       int64
-	real_output     io.WriteCloser
-}
 
 /* Run accepts new connections on stdin, and serves FCGI over the accepted connections.
 
