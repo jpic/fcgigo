@@ -1,20 +1,5 @@
 /* fcgigo is a FastCGI implementation in pure Go.
 
-Minimal example:
-fcgi.Run(func (req *fcgi.Request) {
-	req.Status("200 OK");
-	req.Write("Hello World");
-}, 100);
-
-The above example would result in a program that can be launched by the webserver.
-
-Or, to spawn an external process that listens on a TCP port:
-
-fcgi.RunTCP("localhost:7143", func (req *fcgi.Request) {
-	req.Status("200 OK");
-	req.Write("Hello World");
-}, 100);
-
 */
 package fcgi
 
@@ -492,16 +477,13 @@ type FCGIPacket struct {
 
 func readFCGIPacket(r io.Reader) (*FCGIPacket, os.Error) {
 	p := new(FCGIPacket)
-	// r = io.Reader(NewProxyReader(r));
 	hdr, err := newFCGIHeader(r)
 	if err != nil {
 		return nil, err
 	}
-	// if hdr.Version != 1 {
-	// return nil, os.NewError("Invalid packet.");
-	// }
 	p.hdr = hdr
 	if p.hdr.ContentLength > 0 {
+		// NOTE: we read the extra padding bytes here, and discard them below
 		p.content = make([]byte, p.hdr.ContentLength+uint16(p.hdr.PaddingLength))
 		_, err = r.Read(p.content)
 		if err != nil {
@@ -586,16 +568,4 @@ func Log(msg string, v ...) {
 		os.Stderr.WriteString("LogErr: " + err.String() + "\r\n")
 	}
 	// os.Stderr.WriteString("Log: "+msg+"\r\n");
-}
-
-type ProxyReader struct {
-	io.Reader
-	r io.Reader
-}
-
-func NewProxyReader(r io.Reader) *ProxyReader { return &ProxyReader{r: r} }
-func (self *ProxyReader) Read(b []byte) (n int, err os.Error) {
-	n, err = self.r.Read(b)
-	Log("Read: n:%d b:%s err: %s\r\n", n, b, err)
-	return n, err
 }
