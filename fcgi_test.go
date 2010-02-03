@@ -1,3 +1,6 @@
+// Copyright 2010 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 package fcgi_test
 
 import (
@@ -95,13 +98,13 @@ func TestFcgiNotFound(t *testing.T) {
 	}
 }
 
-// this test will always fail right now, because of http
-func _testFcgiContentLength(t *testing.T) {
+// this test will always fail right now, because of http (bug or feature?)
+func testFcgiContentLength(t *testing.T) {
 	once.Do(startAll)
 	// test that if we specify a fixed content-length that it does not automatically add Transfer-Encoding
 	if response, _, err := http.Get("http://localhost:8181/ContentLength"); err == nil {
 		if n := response.GetHeader("Content-Length"); n == "" {
-			t.Error("Content-Length did not arrive in response.")
+			t.Error("Content-Length did not arrive in response.") // never arrives in response
 		} else {
 			if i, _ := strconv.Atoi(n); i != 14 {
 				t.Error("Content-Length had wrong value, expected 14, got ", n)
@@ -117,7 +120,7 @@ func _testFcgiContentLength(t *testing.T) {
 		} else {
 			t.Error(err)
 		}
-		if enc := response.GetHeader("Transfer-Encoding"); enc == "chunked" {
+		if enc := response.GetHeader("Transfer-Encoding"); enc == "chunked" { // also fails here
 			t.Error("Response still had chunked Transfer-Encoding")
 		}
 	} else {
@@ -140,53 +143,3 @@ func TestFcgiConnection(t *testing.T) {
 }
 
 func TestStopAll(t *testing.T) { stopAll() }
-
-/*
-func TestFcgiHelloWorld(t *testing.T) {
-	once.Do(registerHttp)
-	// this launches a responder on 7134
-	if flisten, err := fcgi.Listen("127.0.0.1:7134"); err == nil {
-		go http.Serve(flisten, nil) // so the fcgi responder is the one using the default mux
-		// then launch a web server
-		if wlisten, err := net.Listen("tcp", ":8181"); err == nil {
-			// create a new ServeMux, we cant use the http.DefaultServeMux
-			// since in this test both servers are in the same space, and they share the same pattern (/hello)
-			mux := http.NewServeMux()
-			// this handler sends /hello requests over the wire
-			mux.Handle("/hello", fcgi.Handler([]string{"127.0.0.1:7134"}))
-			// other handlers can still respond locally, you can freely mix different protocols among different patterns
-			// mux.Handler("/", http.HandlerFunc(HelloServer))
-			go http.Serve(wlisten, mux)
-			log.Stderr("Requesting test page /hello...")
-			log.Stderr("Stopping http server...")
-			wlisten.Close()
-			log.Stderr("Stopping fcgi responder...")
-			flisten.Close()
-		} else {
-			t.Error(err)
-		}
-	} else {
-		t.Error(err)
-	}
-}
-// this is how you launch and test a vanilla hello, world web server
-func TestHttpServer(t *testing.T) {
-	once.Do(registerHttp)
-	log.Stderr("Starting http server...")
-	if listen, err := net.Listen("tcp", ":8181"); err == nil {
-		go http.Serve(listen, nil)
-		log.Stderr("Requesting test page...")
-		if body, err := Get("http://localhost:8181/hello"); err == nil {
-			if !strings.HasPrefix(body, "hello") {
-				t.Error("Bad Body", body)
-			}
-		} else {
-			t.Error(err)
-		}
-		log.Stderr("Stopping http server...")
-		listen.Close()
-	} else {
-		t.Error(err)
-	}
-}
-*/

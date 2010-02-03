@@ -1,8 +1,10 @@
-include $(GOROOT)/src/Make.$(GOARCH)
+include ../../../Make.$(GOARCH)
 
 TARG=fcgi
 GOFILES=\
 	fcgi.go\
+	listener.go\
+	handler.go\
 
 include $(GOROOT)/src/Make.pkg
 
