@@ -125,20 +125,6 @@ func TestStartUnixListener(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-func TestStopUnixListener(t *testing.T) {
-	t.Log("Stopping unix", unixlisten)
-	if err := unixlisten.Close(); err != nil {
-		t.Error(err)
-	}
-}
-func TestStartUnixListenerAgain(t *testing.T) {
-	once.Do(registerFcgiMux)
-	if unixlisten, err := fcgi.Listen("unix", "/tmp/fcgi_test.sock"); err == nil {
-		go http.Serve(unixlisten, fcgiMux)
-	} else {
-		t.Fatal(err)
-	}
-}
 
 func TestStartWebServer(t *testing.T) {
 	once.Do(registerWebMux)
@@ -187,16 +173,16 @@ func TestRemoveTmpFile(t *testing.T) {
 	os.Remove("listener_test_exec.out")
 }
 
-func TestStopUnixListenerAgain(t *testing.T) {
-	t.Log("Stopping unix", unixlisten)
-	if err := unixlisten.Close(); err != nil {
+func TestStopWebServer(t *testing.T) {
+	t.Log("Stopping web", weblisten)
+	if err := weblisten.Close(); err != nil {
 		t.Error(err)
 	}
 }
 
-func TestStopWebServer(t *testing.T) {
-	t.Log("Stopping web", weblisten)
-	if err := weblisten.Close(); err != nil {
+func TestStopUnixListener(t *testing.T) {
+	t.Log("Stopping unix", unixlisten)
+	if err := unixlisten.Close(); err != nil {
 		t.Error(err)
 	}
 }

@@ -415,7 +415,7 @@ func (self *rsConn) fcgiWrite(kind uint8, str string) (n int, err os.Error) {
 // But, once the http server supports keep-alive connections,
 // this assumption will no longer hold, and http.Conn will need to expose its endRequest or something
 func (self *rsConn) Close() os.Error {
-	Log("rsConn: Closed. Sending END messages.")
+	Log("rsConn: Close() -> sending CLOSE and END messages for this request.")
 	// send the done messages
 	if !self.closedOut {
 		self.fcgiWrite(FCGI_STDOUT, "")
@@ -431,6 +431,7 @@ func (self *rsConn) Close() os.Error {
 	}))
 	// did the webserver request that we close this connection
 	if self.close {
+		Log("rsConn: Close()ing real connection to web-server.")
 		self.conn.Close()
 	}
 	Log("rsConn: Done closing.")
@@ -448,7 +449,7 @@ func (self *rsConn) SetWriteTimeout(nsec int64) os.Error {
 	return nil
 }
 func (self *rsConn) String() string {
-	return fmt.Sprint("{rsConn@", self.localAddr.String(), " reqId:", self.reqId, " buffered:", self.buf.Len(), "}")
+	return fmt.Sprint("{rsConn@", self.localAddr.String(), " reqId:", self.reqId, " read buffer:", self.buf.Len(), "}")
 }
 
 // FDListener is a net.Listener that uses syscall.Accept(fd)

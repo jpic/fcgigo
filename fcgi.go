@@ -101,6 +101,7 @@ import (
 // Log is the logging function used throughout this package.
 // By default, it will log nothing.  But, if you set this to log.Stderr, or some other logger that you create, it will use that as well.
 var Log = log.Stderr
+var _ = log.Stderr // reference this so it wont complain about imports
 
 func dontLog(k string, v ...) {}
 

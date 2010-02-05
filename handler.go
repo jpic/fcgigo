@@ -178,25 +178,36 @@ func fcgiDialUnix(addr string) (self *wsConn, err os.Error) {
 // fcgiDialExec will ForkExec a new process, and returns a wsConn that connects to its stdin
 func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 	listenBacklog := 1024
-	socketPath := "/tmp/fcgiauto.sock" // should be computed
+	socketPath := "/tmp/fcgiauto.sock" // TODO: should be dynamic
+	// if the socket file exists, we will get "already in use" when we bind.
+	// if its in use already, then the Remove will fail and propagate the error.
 	if err := os.Remove(socketPath); err != nil {
 		switch err.String() {
-		case "remove " + socketPath + ": no such file or directory": // ignore, it will be created
+		case "remove " + socketPath + ": no such file or directory": // ignore, it will be created later in this case
 		default:
 			return nil, err
 		}
 	}
 	// we can almost use UnixListener to do this except it doesn't expose the fd it's listening on
 	Log("Handler: trying to ForkExec a new responder.")
+	// create a new socket
 	if fd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
+		// i dont know why you would do this for a unix socket, but lighttpd does it
 		if errno := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); errno == 0 {
+			// bind the new socket to socketPath
 			if errno := syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); errno == 0 {
+				// start to listen on that socket
 				if errno := syscall.Listen(fd, listenBacklog); errno == 0 {
 					dir, file := path.Split(binpath)
+					// then ForkExec a new process, and give this listening socket to them as stdin
 					if pid, errno := syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno == 0 {
+						// now create a socket for the client-side of the connection
 						if cfd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
+							// find the address of the socket we gave the new process
 							if sa, errno := syscall.Getsockname(fd); errno == 0 {
+								// connect our client side to the remote address
 								if errno := syscall.Connect(cfd, sa); errno == 0 {
+									// return a wrapper around the client side of this connection
 									Log("Handler: returning new wsConn connected to process", binpath)
 									ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
 									ws.pid = pid
@@ -322,6 +333,7 @@ close:
 
 // Close closes the underlying connection to the FastCGI responder.
 func (self *wsConn) Close() os.Error {
+	Log("wsConn: Close()")
 	if self.pid > 0 {
 		// send the process a SIGTERM
 		Log("wsConn: sending child proc a SIGTERM")
