@@ -1,3 +1,5 @@
 .exrc
 _*
 *.out
+*.log
+*.conf
