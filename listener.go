@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"strconv"
 	"log"
+	"fmt"
 )
 
 // fcgiRequest holds the state for an in-progress request,
@@ -163,7 +164,7 @@ type fcgiListener struct {
 // For tcp, laddr is like "127.0.0.1:1234".
 // For unix, laddr is the absolute path to a socket.
 // For exec, laddr is ignored (input is read from stdin).
-func Listen(net string, laddr string) (net.Listener, os.Error) {
+func Listen(net string, laddr string) (*fcgiListener, os.Error) {
 	switch net {
 	case "tcp", "tcp4", "tcp6":
 		return ListenTCP(laddr)
@@ -172,12 +173,12 @@ func Listen(net string, laddr string) (net.Listener, os.Error) {
 	case "exec":
 		return ListenFD(FCGI_LISTENSOCK_FILENO)
 	}
-	return nil, os.NewError("Invalid network type.")
+	return nil, os.NewError(fmt.Sprint("Invalid network type.", net))
 }
 
 // ListenTCP() creates a new fcgiListener on a tcp socket.
 // listenAddress can be any resolvable local interface and port.
-func ListenTCP(listenAddress string) (net.Listener, os.Error) {
+func ListenTCP(listenAddress string) (*fcgiListener, os.Error) {
 	var err os.Error
 	if l, err := net.Listen("tcp", listenAddress); err == nil {
 		return listen(l)
@@ -187,29 +188,39 @@ func ListenTCP(listenAddress string) (net.Listener, os.Error) {
 
 // ListenUnix creates a new fcgiListener on a unix socket.
 // socketPath should be the absolute path to the socket file.
-func ListenUnix(socketPath string) (net.Listener, os.Error) {
+func ListenUnix(socketPath string) (*fcgiListener, os.Error) {
+	if err := os.Remove(socketPath); err != nil {
+		// there has to be a better way...
+		switch err.String() {
+		case "remove " + socketPath + ": no such file or directory":
+		default:
+			return nil, err
+		}
+	}
 	if l, err := net.Listen("unix", socketPath); err == nil {
-		if l, err = listen(l); err == nil {
+		if ll, err := listen(l); err == nil {
 			log.Stderr("ListenUnix returning", l, nil)
-			return l, nil
+			return ll, nil
 		} else {
 			return nil, err
 		}
-		return l, err
 	} else {
 		return nil, err
 	}
-	panic()
+	panic("ListenUnix should not fall-through")
 }
 
 // ListenFD creates a new fcgiListener on an already open socket.
 // fd is the file descriptor of the open socket.
-func ListenFD(fd int) (net.Listener, os.Error) {
+func ListenFD(fd int) (*fcgiListener, os.Error) {
 	return listen(NewFDListener(fd))
 }
 
 // listen() is the private listener factory behind the different net types
-func listen(listener net.Listener) (net.Listener, os.Error) {
+func listen(listener net.Listener) (*fcgiListener, os.Error) {
+	if listener == nil {
+		return nil, os.NewError("listener cannot be nil")
+	}
 	self := &fcgiListener{
 		Listener: listener,
 		c: make(chan *rsConn),
@@ -321,16 +332,26 @@ func (self *fcgiListener) Accept() (net.Conn, os.Error) {
 		Log("Listener: Accept() releasing connection", c)
 		return net.Conn(c), nil
 	case err := <-self.err:
+		if err == nil {
+			Log("Listener: Accept() read a nil error, and a nil Conn")
+			return nil, os.NewError("Unknown error in Accept()")
+		}
 		return nil, err
 	}
-	return nil, nil
+	panic("Accept should never fall through")
 }
 
-// rsConn is the responder-side of a connection to the webserver, it looks like a net.Conn
+func (self *fcgiListener) Close() os.Error {
+	Log("Listener: Close()")
+	return self.Listener.Close()
+}
+
+
+// rsConn is the responder-side of a connection to the webserver, it looks like a net.Conn.
 // It is created automatically by readAllPackets() and returned by fcgiListener.Accept() from inside http.Serve().
 // It won't be created until a complete request has been buffered off a real socket.
 // Read() here will read from that request buffer only, never a real socket.
-//  - Its possible that in the future calls to Read() would block waiting for chunks of FCGI_STDIN,etc to arrive
+//  - Its possible that in the future calls to Read() would be unbuffered and block waiting for chunks of FCGI_STDIN,etc to arrive.
 // Write() will send FCGI_STDOUT records back to the web server.
 type rsConn struct {
 	reqId      uint16             // the request id to put in the headers of the output packets
@@ -426,6 +447,9 @@ func (self *rsConn) SetReadTimeout(nsec int64) os.Error {
 func (self *rsConn) SetWriteTimeout(nsec int64) os.Error {
 	return nil
 }
+func (self *rsConn) String() string {
+	return fmt.Sprint("{rsConn@", self.localAddr.String(), " reqId:", self.reqId, " buffered:", self.buf.Len(), "}")
+}
 
 // FDListener is a net.Listener that uses syscall.Accept(fd)
 // to accept new connections directly on an already open fd.
@@ -478,6 +502,9 @@ func (f FileConn) SetReadTimeout(ns int64) os.Error {
 }
 func (f FileConn) SetWriteTimeout(ns int64) os.Error {
 	return nil
+}
+func (f FileConn) String() string {
+	return fmt.Sprint("{fileConn@ fd:", f.Fd(), " name:", f.Name(), "}")
 }
 
 // FileAddr is the "address" when we are connected to a FileConn,

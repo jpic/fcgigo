@@ -200,7 +200,7 @@ func (self *fcgiHeader) readContent(r io.Reader) (b []byte, err os.Error) {
 }
 
 // so we dont have to allocate new ones all the time, these are always zero, and we write slices of it for padding
-var paddingSource = make([]byte, 7) // packets are padded to 8-bytes, so if we are padding more than 7 its a whole wasted packet
+var paddingSource = make([]byte, 7) // packets are padded to 8-bytes, so if we are padding more than 7 its wasted
 func (self *fcgiHeader) writePadding(w io.Writer) os.Error {
 	p := self.PaddingLength
 	if p > 0 {

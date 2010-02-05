@@ -68,7 +68,7 @@ var tests = []testRecord{
 	},
 }
 // each test is repeated N times
-var repeatCount = 3 // should be equal to len(responders) inside the handler, so that we test every responder in the list equally
+var repeatCount = 6 // should be an even multiple of len(responders) inside the handler, so that we test every responder equally
 
 func registerFcgiMux() {
 	// for hello world test
@@ -89,16 +89,27 @@ func registerFcgiMux() {
 
 func registerWebMux() {
 	// define the muxer for the http server to use
-	webMux.Handle("/", fcgi.Handler([]string{
-		"tcp://127.0.0.1:7134", // launched above
-		"unix:///tmp/fcgi_test.sock", // launched above
-		"exec:///opt/go/src/pkg/http/listener_test_exec.out", // will be ForkExec'd by the Handler (right now)
-	}))
+	// (all requests go to the pool of listeners)
+	if wd, err := os.Getwd(); err == nil {
+		webMux.Handle("/", fcgi.Handler([]string{
+			"tcp://127.0.0.1:7134",
+			"unix:///tmp/fcgi_test.sock",
+			"exec://" + wd + "/listener_test_exec.out", // will be ForkExec'd by the Handler (right now)
+		}))
+	} else {
+		webMux.Handle("/", fcgi.Handler([]string{
+			"tcp://127.0.0.1:7134",
+			"unix:///tmp/fcgi_test.sock",
+		}))
+	}
 }
 
+// Build the test executable for this part.
+// gotest: make listener_test_exec.out
 func TestStartTcpListener(t *testing.T) {
 	once.Do(registerFcgiMux)
-	if tcplisten, err := fcgi.Listen("tcp", "0.0.0.0:7134"); err == nil {
+	var err os.Error
+	if tcplisten, err = fcgi.Listen("tcp", "0.0.0.0:7134"); err == nil {
 		go http.Serve(tcplisten, fcgiMux)
 	} else {
 		t.Fatal(err)
@@ -106,6 +117,21 @@ func TestStartTcpListener(t *testing.T) {
 }
 
 func TestStartUnixListener(t *testing.T) {
+	once.Do(registerFcgiMux)
+	var err os.Error
+	if unixlisten, err = fcgi.Listen("unix", "/tmp/fcgi_test.sock"); err == nil {
+		go http.Serve(unixlisten, fcgiMux)
+	} else {
+		t.Fatal(err)
+	}
+}
+func TestStopUnixListener(t *testing.T) {
+	t.Log("Stopping unix", unixlisten)
+	if err := unixlisten.Close(); err != nil {
+		t.Error(err)
+	}
+}
+func TestStartUnixListenerAgain(t *testing.T) {
 	once.Do(registerFcgiMux)
 	if unixlisten, err := fcgi.Listen("unix", "/tmp/fcgi_test.sock"); err == nil {
 		go http.Serve(unixlisten, fcgiMux)
@@ -116,7 +142,8 @@ func TestStartUnixListener(t *testing.T) {
 
 func TestStartWebServer(t *testing.T) {
 	once.Do(registerWebMux)
-	if weblisten, err := net.Listen("tcp", ":8181"); err == nil {
+	var err os.Error
+	if weblisten, err = net.Listen("tcp", ":8181"); err == nil {
 		go http.Serve(weblisten, webMux)
 	} else {
 		t.Fatal(err)
@@ -128,25 +155,23 @@ func TestRunTests(t *testing.T) {
 		for j := 0; j < repeatCount; j++ {
 			if response, _, err := http.Get(test.URL); err == nil {
 				if response.StatusCode != test.StatusCode {
-					t.Error(test.URL, "Response had wrong status code:", response.StatusCode)
+					t.Error(test.URL, j, "Response had wrong status code:", response.StatusCode)
 				}
 				if len(test.BodyPrefix) > 0 {
 					prefix := make([]byte, len(test.BodyPrefix))
 					if n, err := response.Body.Read(prefix); err == nil {
-						if n < len(prefix) {
-							t.Error(test.URL, "Short read")
-						}
-						if string(prefix) != test.BodyPrefix {
-							t.Error(test.URL, "Bad body, expected prefix:", test.BodyPrefix, "got:", string(prefix))
+						p := string(prefix[0:n])
+						if p != test.BodyPrefix {
+							t.Error(test.URL, j, "Bad body, expected prefix:", test.BodyPrefix, "got:", p)
 						}
 					} else {
-						t.Error(test.URL, "Error reading response.Body:", err)
+						t.Error(test.URL, j, "Error reading response.Body:", err)
 					}
 				}
 				if test.Headers != nil {
 					for _, hdr := range test.Headers {
 						if v := response.GetHeader(hdr.Key); v != hdr.Val {
-							t.Error(test.URL, "Header value in response:", strconv.Quote(v), "did not match", strconv.Quote(hdr.Val))
+							t.Error(test.URL, j, "Header value in response:", strconv.Quote(v), "did not match", strconv.Quote(hdr.Val))
 						}
 					}
 				}
@@ -157,25 +182,28 @@ func TestRunTests(t *testing.T) {
 	}
 }
 
-func TestRemoveTmpFile(t *testing.T) { os.Remove("/tmp/fcgi_test.html") }
+func TestRemoveTmpFile(t *testing.T) {
+	os.Remove("/tmp/fcgi_test.html")
+	os.Remove("listener_test_exec.out")
+}
+
+func TestStopUnixListenerAgain(t *testing.T) {
+	t.Log("Stopping unix", unixlisten)
+	if err := unixlisten.Close(); err != nil {
+		t.Error(err)
+	}
+}
 
 func TestStopWebServer(t *testing.T) {
-	if weblisten == nil {
-		t.Error("weblisten is already nil?")
-	}
+	t.Log("Stopping web", weblisten)
 	if err := weblisten.Close(); err != nil {
 		t.Error(err)
 	}
 }
 
 func TestStopTcpListener(t *testing.T) {
+	t.Log("Stopping TCP", tcplisten)
 	if err := tcplisten.Close(); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestStopUnixListener(t *testing.T) {
-	if err := unixlisten.Close(); err != nil {
 		t.Error(err)
 	}
 }

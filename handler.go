@@ -20,7 +20,6 @@ import (
 	"path"
 )
 
-
 // Handler returns an http.Handler that will dispatch requests to FastCGI Responders
 // addrs are a list of addresses that include a prefix for what kind of network they are on
 // e.g. tcp://127.0.0.1:1234, unix:///tmp/some.sock, exec:///usr/bin/php
@@ -37,18 +36,18 @@ func Handler(addrs []string) http.Handler {
 		}
 		switch strings.ToLower(s[0]) {
 		case "tcp":
-			if responders[i], err = fcgiDialTcp(s[1]); err != nil {
+			if responders[i], err = fcgiDialTcp(s[1]); err != nil || responders[i] == nil {
 				Log("Handler: failed to connect to tcp responder:", s[1], err)
 				// on non-fatal (to the whole Handler) errors just make a note for a little later
 				e += 1
 			}
 		case "unix":
-			if responders[i], err = fcgiDialUnix(s[1]); err != nil {
+			if responders[i], err = fcgiDialUnix(s[1]); err != nil || responders[i] == nil {
 				Log("Handler: failed to connect to responder on unix socket:", s[1], err)
 				e += 1
 			}
 		case "exec":
-			if responders[i], err = fcgiDialExec(s[1]); err != nil {
+			if responders[i], err = fcgiDialExec(s[1]); err != nil || responders[i] == nil {
 				Log("Handler: failed to exec fcgi responder program:", s[1], err)
 				e += 1
 			}
@@ -134,6 +133,7 @@ func errorHandler(status int, msg string) http.Handler {
 // wsConn is the webserver-side of a connection to a FastCGI Responder
 type wsConn struct {
 	addr    string
+	pid     int // only meaningful when addr is exec://...
 	conn    io.ReadWriteCloser
 	buffers []*closeBuffer // a closable bytes.Buffer
 	signals []chan bool    // used to signal ReadResponse
@@ -141,11 +141,14 @@ type wsConn struct {
 }
 
 func newWsConn(conn io.ReadWriteCloser, addr string) *wsConn {
+	if conn == nil {
+		return nil
+	}
 	self := &wsConn{
 		addr: addr,
 		conn: conn,
-		buffers: make([]*closeBuffer, 65535),
-		signals: make([]chan bool, 65535),
+		buffers: make([]*closeBuffer, 256),
+		signals: make([]chan bool, 256),
 		nextId: 1,
 	}
 	for i, _ := range self.signals {
@@ -164,7 +167,7 @@ func fcgiDialTcp(addr string) (self *wsConn, err os.Error) {
 	return self, err
 }
 
-// fcgiDialTcp connects to a FastCGI Responder over TCP, and returns the wsConn for the connection
+// fcgiDialUnix connects to a FastCGI Responder over a Unix socket, and returns the wsConn for the connection
 func fcgiDialUnix(addr string) (self *wsConn, err os.Error) {
 	if conn, err := dialUnixAddr(addr); err == nil {
 		self = newWsConn(conn, addr)
@@ -174,32 +177,30 @@ func fcgiDialUnix(addr string) (self *wsConn, err os.Error) {
 
 // fcgiDialExec will ForkExec a new process, and returns a wsConn that connects to its stdin
 func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
-	// TODO: in the future, each binpath should map to a list of launched processes, so they can be reused
-
-	// to do the basic operation, lighttpd opens a unix socket, calls listen() on it, then forks and gives that fd to the child process as their stdin
+	listenBacklog := 1024
+	socketPath := "/tmp/fcgiauto.sock" // should be computed
+	if err := os.Remove(socketPath); err != nil {
+		switch err.String() {
+		case "remove " + socketPath + ": no such file or directory": // ignore, it will be created
+		default:
+			return nil, err
+		}
+	}
 	// we can almost use UnixListener to do this except it doesn't expose the fd it's listening on
 	Log("Handler: trying to ForkExec a new responder.")
-	Log("Handler: creating Socket")
 	if fd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
-		Log("Handler: calling Setsockopt")
 		if errno := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); errno == 0 {
-			Log("Handler: calling Bind")
-			if errno := syscall.Bind(fd, &syscall.SockaddrUnix{Name: "/tmp/fcgiauto.sock"}); errno == 0 {
-				Log("Handler: calling Listen")
-				if errno := syscall.Listen(fd, 1024); errno == 0 {
+			if errno := syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); errno == 0 {
+				if errno := syscall.Listen(fd, listenBacklog); errno == 0 {
 					dir, file := path.Split(binpath)
-					Log("Handler: split path into", dir, file)
-					Log("Handler: calling ForkExec")
-					if _, errno := syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno == 0 {
-						Log("Handler: creating a client socket for us")
+					if pid, errno := syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno == 0 {
 						if cfd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
-							Log("Handler: calling Getsockname(fd)")
 							if sa, errno := syscall.Getsockname(fd); errno == 0 {
-								Log("Handler: sa = ", sa)
-								Log("Handler: calling Connect()")
 								if errno := syscall.Connect(cfd, sa); errno == 0 {
 									Log("Handler: returning new wsConn connected to process", binpath)
-									return newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath), nil
+									ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
+									ws.pid = pid
+									return ws, nil
 								} else {
 									Log("Connect failed:", syscall.Errstr(errno))
 									return nil, os.NewError(fmt.Sprint("Connect failed:", syscall.Errstr(errno)))
@@ -249,7 +250,7 @@ func (self *wsConn) fcgiWrite(kind uint8, id uint16, data []byte) (n int, err os
 }
 
 // readAllPackets is a goroutine that reads everything from the connection
-// and dispatches responses when they are complete (FCGI_END_REQUEST) is recieved
+// and dispatches responses when they are complete (FCGI_END_REQUEST is recieved).
 func (self *wsConn) readAllPackets() {
 	h := &fcgiHeader{}
 	for {
@@ -293,7 +294,7 @@ func (self *wsConn) readAllPackets() {
 				Log("wsConn: got END_REQUEST")
 				e := new(fcgiEndRequest)
 				readStruct(self.conn, e)
-				Log("wsConn: appStatus ", e.AppStatus, " protocolStatus ", e.ProtocolStatus)
+				Log("wsConn: appStatus", e.AppStatus, "protocolStatus", e.ProtocolStatus)
 				buf := self.buffers[h.ReqId]
 				switch e.ProtocolStatus {
 				case FCGI_REQUEST_COMPLETE:
@@ -319,10 +320,20 @@ close:
 	self.Close()
 }
 
-// Close closes the underlying connection to the FastCGI responder
-func (self *wsConn) Close() os.Error { return self.conn.Close() }
+// Close closes the underlying connection to the FastCGI responder.
+func (self *wsConn) Close() os.Error {
+	if self.pid > 0 {
+		// send the process a SIGTERM
+		Log("wsConn: sending child proc a SIGTERM")
+		syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGTERM, 0)
+		if _, err := os.Wait(self.pid, 0); err != nil {
+			return err
+		}
+	}
+	return self.conn.Close()
+}
 
-// getNextReqId is an iterator that produces un-used request ids
+// getNextReqId is an iterator that produces un-used request ids.
 func (self *wsConn) getNextReqId() (reqid uint16) {
 	start := self.nextId
 	for self.buffers[self.nextId] != nil {
@@ -337,7 +348,7 @@ func (self *wsConn) getNextReqId() (reqid uint16) {
 	return self.nextId
 }
 
-// freeReqId marks a reqId as usable for another request on this connection
+// freeReqId marks a reqId as usable for another request on this connection.
 func (self *wsConn) freeReqId(reqid uint16) {
 	self.buffers[reqid] = nil
 	self.nextId = reqid
@@ -421,22 +432,25 @@ func (self *wsConn) ReadResponse(reqid uint16, method string) (ret *http.Respons
 	return ret, err
 }
 
-// closeBuffer is a closable buffer, after .Close(), .Write() returns EOF error
+// closeBuffer is a closable buffer, after .Close(), .Write() returns EOF error.
 type closeBuffer struct {
 	bytes.Buffer
 	closed bool
 }
+
 // Reset() is the same as Truncate(0) but also re-opens the buffer if it was closed.
 func (self *closeBuffer) Reset() {
 	self.closed = false
 	self.Buffer.Reset()
 }
+
 // Close causes any future writes to return EOF.  Reads can continue until the buffer is empty.
 func (self *closeBuffer) Close() os.Error {
 	self.closed = true
 	return nil
 }
-// Write works like normal except that if the buffer has been closed, it returns (0, os.EOF)
+
+// Write works like normal except that if the buffer has been closed, it returns (0, os.EOF).
 func (self *closeBuffer) Write(p []byte) (n int, err os.Error) {
 	if self.closed {
 		return 0, os.EOF
