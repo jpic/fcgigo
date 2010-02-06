@@ -219,7 +219,7 @@ func (self *fcgiHeader) writePadding(w io.Writer) os.Error {
 // fcgiWrite() writes a single FastCGI record to a Writer
 func fcgiWrite(conn io.Writer, kind uint8, reqId uint16, b []byte) (n int, err os.Error) {
 	h := newFcgiHeader(kind, reqId, len(b))
-	Log("fcgiWrite: Header", conn, h)
+	// Log("fcgiWrite: Header", conn, h)
 	writeStruct(conn, h)
 	if len(b) > 0 {
 		n, err = conn.Write(b)
