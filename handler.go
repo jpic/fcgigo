@@ -14,10 +14,10 @@ import (
 	"bytes"
 	"http"
 	"strings"
-	"strconv"
 	"fmt"
 	"syscall"
 	"path"
+	"runtime"
 )
 
 // Handler returns an http.Handler that will dispatch requests to FastCGI Responders
@@ -58,7 +58,6 @@ func Handler(addrs []string) http.Handler {
 	// collapse the list of responders, removing connection errors
 	if e > 0 {
 		if e == len(responders) {
-			Log("Handler: returning 503, e == len(responders)")
 			return errorHandler(http.StatusServiceUnavailable, "No FastCGIResponders connected.")
 		}
 		tmp := make([]*wsConn, len(responders)-e)
@@ -72,7 +71,6 @@ func Handler(addrs []string) http.Handler {
 		responders = tmp
 	}
 	if len(responders) == 0 {
-		Log("Handler: returning 503 len(responders) == 0")
 		return errorHandler(http.StatusServiceUnavailable, "No FastCGIResponders connected.")
 	}
 
@@ -92,28 +90,21 @@ func Handler(addrs []string) http.Handler {
 		if responder != nil {
 			reqid := responder.WriteRequest(conn, req)
 			// read the response (blocking)
-			Log("Handler: reading Response", reqid)
 			if response, err := responder.ReadResponse(reqid, req.Method); err == nil {
 				// once it is ready, write it out to the real connection
-				Log("Handler: writing Response to real Conn", reqid, response)
 				for k, v := range response.Header {
-					Log("Handler: setting header ", k, v)
 					conn.SetHeader(k, v)
 				}
-				Log("Handler: sending response status ", response.StatusCode)
 				conn.WriteHeader(response.StatusCode)
-				Log("Handler: sending body")
 				if b, err := ioutil.ReadAll(response.Body); err == nil {
 					conn.Write(b)
 				}
-				Log("Handler: response completely sent to real Conn.")
 			} else {
 				Log("Handler: Failed to read response: ", err)
 				conn.WriteHeader(http.StatusInternalServerError)
 			}
 		} else {
-			Log("Handler: got a nil responder, must be overloaded.")
-			// should be impossible...
+			Log("Handler: getNextResponder() is nil, must be overloaded.")
 			conn.WriteHeader(http.StatusServiceUnavailable)
 		}
 	})
@@ -189,7 +180,6 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 		}
 	}
 	// we can almost use UnixListener to do this except it doesn't expose the fd it's listening on
-	Log("Handler: trying to ForkExec a new responder.")
 	// create a new socket
 	if fd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
 		// i dont know why you would do this for a unix socket, but lighttpd does it
@@ -208,9 +198,10 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 								// connect our client side to the remote address
 								if errno := syscall.Connect(cfd, sa); errno == 0 {
 									// return a wrapper around the client side of this connection
-									Log("Handler: returning new wsConn connected to process", binpath)
+									// Log("Handler: returning new wsConn connected to process", binpath)
 									ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
 									ws.pid = pid
+									runtime.SetFinalizer(ws, finalizer)
 									return ws, nil
 								} else {
 									Log("Connect failed:", syscall.Errstr(errno))
@@ -247,6 +238,21 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 	panic()
 }
 
+// finalizer will be passed to runtime.SetFinalizer, and be used to kill the child process this connection created
+// if we miss this, the child checks periodically to see if we died, so it will go down eventually on its own
+func finalizer(self *wsConn) {
+	Log("wsConn: finalizer")
+	if self.pid > 0 {
+		// send the process a SIGTERM
+		Log("wsConn: sending child proc a SIGTERM")
+		syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGTERM, 0)
+		// if _, err := os.Wait(self.pid, 0); err != nil {
+		// syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGKILL, 0)
+		// return
+		// }
+	}
+}
+
 // String() returns a descriptive string about this connection
 func (self *wsConn) String() string {
 	if self == nil {
@@ -269,7 +275,6 @@ func (self *wsConn) readAllPackets() {
 		err := readStruct(self.conn, h)
 		switch {
 		case err == os.EOF:
-			Log("wsConn: EOF")
 			goto close
 		case err != nil:
 			Log("wsConn: error reading FcgiHeader:", err)
@@ -285,7 +290,7 @@ func (self *wsConn) readAllPackets() {
 			switch h.Kind {
 			case FCGI_STDOUT:
 				if content, err := h.readContent(self.conn); err == nil {
-					Log("wsConn: got STDOUT:", strconv.Quote(string(content)))
+					// Log("wsConn: got STDOUT:", strconv.Quote(string(content)))
 					if len(content) > 0 {
 						req.Write(content)
 					} else {
@@ -294,7 +299,7 @@ func (self *wsConn) readAllPackets() {
 				}
 			case FCGI_STDERR:
 				if content, err := h.readContent(self.conn); err == nil {
-					Log("wsConn: got STDERR:", strconv.Quote(string(content)))
+					// Log("wsConn: got STDERR:", strconv.Quote(string(content)))
 					if len(content) > 0 {
 						req.WriteString("Error: ")
 						req.Write(content)
@@ -302,10 +307,10 @@ func (self *wsConn) readAllPackets() {
 					}
 				}
 			case FCGI_END_REQUEST:
-				Log("wsConn: got END_REQUEST")
+				Log("wsConn: got END_REQUEST", h.ReqId)
 				e := new(fcgiEndRequest)
 				readStruct(self.conn, e)
-				Log("wsConn: appStatus", e.AppStatus, "protocolStatus", e.ProtocolStatus)
+				// Log("wsConn: appStatus", e.AppStatus, "protocolStatus", e.ProtocolStatus)
 				buf := self.buffers[h.ReqId]
 				switch e.ProtocolStatus {
 				case FCGI_REQUEST_COMPLETE:
@@ -334,14 +339,6 @@ close:
 // Close closes the underlying connection to the FastCGI responder.
 func (self *wsConn) Close() os.Error {
 	Log("wsConn: Close()")
-	if self.pid > 0 {
-		// send the process a SIGTERM
-		Log("wsConn: sending child proc a SIGTERM")
-		syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGTERM, 0)
-		if _, err := os.Wait(self.pid, 0); err != nil {
-			return err
-		}
-	}
 	return self.conn.Close()
 }
 
@@ -372,14 +369,13 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 	reqid = self.getNextReqId()
 	freq := getFcgiRequest(reqid, con, req)
 	self.buffers[reqid] = new(closeBuffer)
-	Log("wsConn: sending BEGIN_REQUEST")
+	Log("wsConn: sending BEGIN_REQUEST", reqid)
 	/* Send a FCGI_BEGIN_REQUEST */
 	writeStruct(self.conn, newFcgiHeader(FCGI_BEGIN_REQUEST, reqid, 8))
 	// default to keeping the fcgi connection open
 	flags := uint8(FCGI_KEEP_CONN)
 	// unless requested otherwise by the http.Request
 	if req.Close {
-		Log("wsConn: setting fcgiRequest to close the fcgi connection, is this right?")
 		flags = 0
 	}
 	writeStruct(self.conn, fcgiBeginRequest{
@@ -394,11 +390,11 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 		buf.WriteString(k)
 		buf.WriteString(v)
 	}
-	Log("wsConn: sending FCGI_PARAMS")
+	// Log("wsConn: sending FCGI_PARAMS")
 	self.fcgiWrite(FCGI_PARAMS, reqid, buf.Bytes())
 	buf2 := make([]byte, 0, FCGI_MAX_WRITE)
 	/* Now write the FCGI_STDIN, read from the Body of the request */
-	Log("wsConn: sending FCGI_STDIN")
+	// Log("wsConn: sending FCGI_STDIN")
 	// get the stdin data from the fcgiRequest
 	for freq.stdin != nil && freq.stdin.Len() > 0 {
 		n, err := freq.stdin.Read(buf2[0:])
@@ -408,14 +404,14 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 			Log("wsConn: Error reading fcgiRequest.stdin:", err)
 			break
 		} else {
-			Log("wsConn: sending FCGI_STDIN")
+			// Log("wsConn: sending FCGI_STDIN")
 			self.fcgiWrite(FCGI_STDIN, reqid, buf2[0:n])
 		}
 	}
 	// write the last FCGI_STDIN
 	self.fcgiWrite(FCGI_STDIN, reqid, []byte{})
 	/* Send the FCGI_DATA */
-	Log("wsConn: sending FCGI_DATA")
+	// Log("wsConn: sending FCGI_DATA")
 	for freq.data != nil && freq.data.Len() > 0 {
 		n, err := freq.data.Read(buf2[0:])
 		if n == 0 || err == os.EOF {
@@ -424,7 +420,7 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 			Log("Error reading fcgiRequest.data:", err)
 			break
 		} else {
-			Log("wsConn: sending FCGI_DATA")
+			// Log("wsConn: sending FCGI_DATA")
 			self.fcgiWrite(FCGI_DATA, reqid, buf2[0:n])
 		}
 	}
@@ -438,7 +434,6 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 // After the response is read, the reqid is freed, and might immediately be used again for a new request.
 func (self *wsConn) ReadResponse(reqid uint16, method string) (ret *http.Response, err os.Error) {
 	<-self.signals[reqid] // wait for this reqid to be finished
-	Log("wsConn: ReadResponse ready for reqid", reqid)
 	ret, err = http.ReadResponse(bufio.NewReader(self.buffers[reqid]), method)
 	self.freeReqId(reqid)
 	return ret, err
