@@ -76,12 +76,10 @@ func getFcgiRequest(reqid uint16, conn *http.Conn, req *http.Request) *fcgiReque
 	}
 	// patch the ?query_string to include the #fragment
 	if len(req.URL.Fragment) > 0 {
-		Log("FcgiConn: adding fragment to query string")
 		self.params["QUERY_STRING"] = self.params["QUERY_STRING"] + "#" + req.URL.Fragment
 	}
 	// carry over the content-length
 	if c, ok := req.Header["Content-Length"]; ok {
-		Log("FcgiConn: Setting content-length")
 		self.params["CONTENT_LENGTH"] = c
 	}
 	// store the HTTP_HEADER_NAME version of each header
@@ -93,7 +91,7 @@ func getFcgiRequest(reqid uint16, conn *http.Conn, req *http.Request) *fcgiReque
 			return c
 		},
 			"HTTP_"+strings.ToUpper(k))
-		Log("Saving Param:", k, v)
+		//Log("Saving Param:", k, v)
 		self.params[k] = v
 	}
 	return self
@@ -147,7 +145,7 @@ func (self *fcgiRequest) parseFcgiParams(text []byte) {
 		key, slice = getOneValue(slice, key_len)
 		val, slice = getOneValue(slice, val_len)
 		self.params[key] = val
-		Log("Param:", key, val)
+		//Log("Param:", key, val)
 	}
 }
 
@@ -155,6 +153,7 @@ func (self *fcgiRequest) parseFcgiParams(text []byte) {
 // http.Serve() will then, in effect, be running a FastCGI Responder
 type fcgiListener struct {
 	net.Listener
+	net string // tcp, unix, or exec
 	c   chan *rsConn
 	err chan os.Error
 }
@@ -164,7 +163,7 @@ type fcgiListener struct {
 // For tcp, laddr is like "127.0.0.1:1234".
 // For unix, laddr is the absolute path to a socket.
 // For exec, laddr is ignored (input is read from stdin).
-func Listen(net string, laddr string) (*fcgiListener, os.Error) {
+func Listen(net string, laddr string) (net.Listener, os.Error) {
 	switch net {
 	case "tcp", "tcp4", "tcp6":
 		return ListenTCP(laddr)
@@ -178,17 +177,19 @@ func Listen(net string, laddr string) (*fcgiListener, os.Error) {
 
 // ListenTCP() creates a new fcgiListener on a tcp socket.
 // listenAddress can be any resolvable local interface and port.
-func ListenTCP(listenAddress string) (*fcgiListener, os.Error) {
+func ListenTCP(listenAddress string) (net.Listener, os.Error) {
 	var err os.Error
 	if l, err := net.Listen("tcp", listenAddress); err == nil {
-		return listen(l)
+		ret, err := listen("tcp", l)
+		log.Stderr("ListenTCP returning", ret, err)
+		return ret, err
 	}
 	return nil, err
 }
 
 // ListenUnix creates a new fcgiListener on a unix socket.
 // socketPath should be the absolute path to the socket file.
-func ListenUnix(socketPath string) (*fcgiListener, os.Error) {
+func ListenUnix(socketPath string) (net.Listener, os.Error) {
 	if err := os.Remove(socketPath); err != nil {
 		// there has to be a better way...
 		switch err.String() {
@@ -198,8 +199,8 @@ func ListenUnix(socketPath string) (*fcgiListener, os.Error) {
 		}
 	}
 	if l, err := net.Listen("unix", socketPath); err == nil {
-		if ll, err := listen(l); err == nil {
-			log.Stderr("ListenUnix returning", l, nil)
+		if ll, err := listen("unix", l); err == nil {
+			log.Stderr("ListenUnix returning", ll, nil)
 			return ll, nil
 		} else {
 			return nil, err
@@ -212,17 +213,19 @@ func ListenUnix(socketPath string) (*fcgiListener, os.Error) {
 
 // ListenFD creates a new fcgiListener on an already open socket.
 // fd is the file descriptor of the open socket.
-func ListenFD(fd int) (*fcgiListener, os.Error) {
-	return listen(NewFDListener(fd))
+func ListenFD(fd int) (net.Listener, os.Error) {
+	ret, err := listen("exec", NewFDListener(fd))
+	return ret, err
 }
 
 // listen() is the private listener factory behind the different net types
-func listen(listener net.Listener) (*fcgiListener, os.Error) {
+func listen(net string, listener net.Listener) (*fcgiListener, os.Error) {
 	if listener == nil {
 		return nil, os.NewError("listener cannot be nil")
 	}
 	self := &fcgiListener{
 		Listener: listener,
+		net: net,
 		c: make(chan *rsConn),
 		err: make(chan os.Error, 1),
 	}
@@ -230,9 +233,6 @@ func listen(listener net.Listener) (*fcgiListener, os.Error) {
 	// then starts reading packets from it until it's complete enough to Accept
 	go func() {
 		for {
-			if self == nil || self.Listener == nil {
-				break
-			}
 			if c, err := self.Listener.Accept(); err == nil {
 				go self.readAllPackets(c) // once enough packets have been read, fcgiListener.Accept() will yield a connection
 			} else {
@@ -241,6 +241,20 @@ func listen(listener net.Listener) (*fcgiListener, os.Error) {
 			}
 		}
 	}()
+	if net == "exec" {
+		// there is no finalizer that is guaranteed to run before the parent process exits
+		// so when the webserver dies, we cant send kill signals to the spawned processes
+		// so here, in the exec'd child, we start a slow-poll to check if our parent has died
+		go func() {
+			for {
+				time.Sleep(5e9)
+				// our parent is gone, we need to die
+				if os.Getppid() == 1 {
+					os.Exit(1)
+				}
+			}
+		}()
+	}
 	return self, nil
 }
 
@@ -254,7 +268,6 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 		err := readStruct(conn, h)
 		switch {
 		case err == os.EOF:
-			Log("Listener: EOF")
 			goto close
 		case err != nil:
 			Log("Listener: error reading fcgiHeader", err)
@@ -268,18 +281,18 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 		case FCGI_BEGIN_REQUEST:
 			b := new(fcgiBeginRequest)
 			readStruct(conn, b)
-			Log("Listener: got FCGI_BEGIN_REQUEST", b)
+			Log("Listener: got FCGI_BEGIN_REQUEST", h.ReqId)
 			req = newFcgiRequest(h.ReqId, conn, b.Flags)
 			requests[h.ReqId] = req
 		case FCGI_PARAMS:
-			Log("Listener: got FCGI_PARAMS")
+			// Log("Listener: got FCGI_PARAMS")
 			if content, err := h.readContent(conn); err == nil {
 				req.parseFcgiParams(content)
 			} else {
 				Log("Error reading content:", err)
 			}
 		case FCGI_STDIN:
-			Log("Listener: got FCGI_STDIN", h.ContentLength, "bytes")
+			// Log("Listener: got FCGI_STDIN", h.ContentLength, "bytes")
 			if h.ContentLength == uint16(0) {
 				// now the request has enough data to build our fake http.Conn
 				self.c <- newRsConn(conn, req)
@@ -295,8 +308,8 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 			Log("Listener: FCGI_GET_VALUES")
 			// TODO: respond with GET_VALUES_RESULT
 		case FCGI_DATA:
-			Log("Listener: got FCGI_DATA", h.ContentLength, "bytes")
 			if h.ContentLength > uint16(0) {
+				Log("Listener: got FCGI_DATA", h.ContentLength, "bytes")
 				if content, err := h.readContent(conn); err == nil {
 					req.data.Write(content)
 				} else {
@@ -329,12 +342,13 @@ close:
 func (self *fcgiListener) Accept() (net.Conn, os.Error) {
 	select {
 	case c := <-self.c:
-		Log("Listener: Accept() releasing connection", c)
+		if c == nil {
+			return nil, os.NewError("Listener: Can't accept a nil connection.")
+		}
 		return net.Conn(c), nil
 	case err := <-self.err:
 		if err == nil {
-			Log("Listener: Accept() read a nil error, and a nil Conn")
-			return nil, os.NewError("Unknown error in Accept()")
+			return nil, os.NewError("Unknown error in Accept(), a nil error was sent on the error channel.")
 		}
 		return nil, err
 	}
@@ -415,7 +429,7 @@ func (self *rsConn) fcgiWrite(kind uint8, str string) (n int, err os.Error) {
 // But, once the http server supports keep-alive connections,
 // this assumption will no longer hold, and http.Conn will need to expose its endRequest or something
 func (self *rsConn) Close() os.Error {
-	Log("rsConn: Close() -> sending CLOSE and END messages for this request.")
+	// Log("rsConn: Close() -> sending CLOSE and END messages for this request.")
 	// send the done messages
 	if !self.closedOut {
 		self.fcgiWrite(FCGI_STDOUT, "")
@@ -434,7 +448,7 @@ func (self *rsConn) Close() os.Error {
 		Log("rsConn: Close()ing real connection to web-server.")
 		self.conn.Close()
 	}
-	Log("rsConn: Done closing.")
+	// Log("rsConn: Done closing.")
 	return nil
 }
 func (self *rsConn) LocalAddr() net.Addr  { return self.localAddr }
