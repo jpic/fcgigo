@@ -28,6 +28,8 @@ var (
 
 	// the mux used by the HTTP Listener
 	webMux = http.NewServeMux()
+
+	done = make(chan int, 1) // for syncing the multiplex tests
 )
 
 type testRecord struct {
@@ -136,41 +138,61 @@ func TestStartWebServer(t *testing.T) {
 	}
 }
 
+func runTest(test testRecord, j int, t *testing.T) {
+	defer func() { done <- 1 }()
+	if response, _, err := http.Get(test.URL); err == nil {
+		if response.StatusCode != test.StatusCode {
+			t.Error(test.URL, j, "Response had wrong status code:", response.StatusCode)
+		}
+		if len(test.BodyPrefix) > 0 {
+			prefix := make([]byte, len(test.BodyPrefix))
+			if n, err := response.Body.Read(prefix); err == nil {
+				p := string(prefix[0:n])
+				if p != test.BodyPrefix {
+					t.Error(test.URL, j, "Bad body, expected prefix:", test.BodyPrefix, "got:", p)
+				}
+			} else {
+				t.Error(test.URL, j, "Error reading response.Body:", err)
+			}
+		}
+		if test.Headers != nil {
+			for _, hdr := range test.Headers {
+				if v := response.GetHeader(hdr.Key); v != hdr.Val {
+					t.Error(test.URL, j, "Header value in response:", strconv.Quote(v), "did not match", strconv.Quote(hdr.Val))
+				}
+			}
+		}
+	} else {
+		t.Error(err)
+	}
+}
+
 func TestRunTests(t *testing.T) {
 	for _, test := range tests {
 		for j := 0; j < repeatCount; j++ {
-			if response, _, err := http.Get(test.URL); err == nil {
-				if response.StatusCode != test.StatusCode {
-					t.Error(test.URL, j, "Response had wrong status code:", response.StatusCode)
-				}
-				if len(test.BodyPrefix) > 0 {
-					prefix := make([]byte, len(test.BodyPrefix))
-					if n, err := response.Body.Read(prefix); err == nil {
-						p := string(prefix[0:n])
-						if p != test.BodyPrefix {
-							t.Error(test.URL, j, "Bad body, expected prefix:", test.BodyPrefix, "got:", p)
-						}
-					} else {
-						t.Error(test.URL, j, "Error reading response.Body:", err)
-					}
-				}
-				if test.Headers != nil {
-					for _, hdr := range test.Headers {
-						if v := response.GetHeader(hdr.Key); v != hdr.Val {
-							t.Error(test.URL, j, "Header value in response:", strconv.Quote(v), "did not match", strconv.Quote(hdr.Val))
-						}
-					}
-				}
-			} else {
-				t.Error(err)
-			}
+			runTest(test, j, t)
+			<-done
 		}
+	}
+}
+
+func TestRunTestsMultiplex(t *testing.T) {
+	t.Log("Starting multiplex tests.")
+	for _, test := range tests {
+		for j := 0; j < repeatCount; j++ {
+			go runTest(test, j, t)
+		}
+	}
+	t.Log("Waiting for multiplex tests to finish.")
+	for i := 0; i < len(tests)*repeatCount; i++ {
+		<-done
 	}
 }
 
 func TestRemoveTmpFile(t *testing.T) {
 	os.Remove("/tmp/fcgi_test.html")
 	os.Remove("listener_test_exec.out")
+	os.Remove("listener_test_exec.out.8")
 }
 
 func TestStopWebServer(t *testing.T) {
