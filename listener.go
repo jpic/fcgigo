@@ -16,7 +16,6 @@ import (
 	"strings"
 	"syscall"
 	"strconv"
-	"log"
 	"fmt"
 )
 
@@ -166,30 +165,29 @@ type fcgiListener struct {
 func Listen(net string, laddr string) (net.Listener, os.Error) {
 	switch net {
 	case "tcp", "tcp4", "tcp6":
-		return ListenTCP(laddr)
+		return listenTCP(laddr)
 	case "unix":
-		return ListenUnix(laddr)
+		return listenUnix(laddr)
 	case "exec":
-		return ListenFD(FCGI_LISTENSOCK_FILENO)
+		return listenFD(FCGI_LISTENSOCK_FILENO)
 	}
 	return nil, os.NewError(fmt.Sprint("Invalid network type.", net))
 }
 
-// ListenTCP() creates a new fcgiListener on a tcp socket.
+// listenTCP() creates a new fcgiListener on a tcp socket.
 // listenAddress can be any resolvable local interface and port.
-func ListenTCP(listenAddress string) (net.Listener, os.Error) {
+func listenTCP(listenAddress string) (net.Listener, os.Error) {
 	var err os.Error
 	if l, err := net.Listen("tcp", listenAddress); err == nil {
 		ret, err := listen("tcp", l)
-		log.Stderr("ListenTCP returning", ret, err)
 		return ret, err
 	}
 	return nil, err
 }
 
-// ListenUnix creates a new fcgiListener on a unix socket.
+// listenUnix creates a new fcgiListener on a unix socket.
 // socketPath should be the absolute path to the socket file.
-func ListenUnix(socketPath string) (net.Listener, os.Error) {
+func listenUnix(socketPath string) (net.Listener, os.Error) {
 	if err := os.Remove(socketPath); err != nil {
 		// there has to be a better way...
 		switch err.String() {
@@ -200,7 +198,6 @@ func ListenUnix(socketPath string) (net.Listener, os.Error) {
 	}
 	if l, err := net.Listen("unix", socketPath); err == nil {
 		if ll, err := listen("unix", l); err == nil {
-			log.Stderr("ListenUnix returning", ll, nil)
 			return ll, nil
 		} else {
 			return nil, err
@@ -208,13 +205,13 @@ func ListenUnix(socketPath string) (net.Listener, os.Error) {
 	} else {
 		return nil, err
 	}
-	panic("ListenUnix should not fall-through")
+	panic("listenUnix should not fall-through")
 }
 
-// ListenFD creates a new fcgiListener on an already open socket.
+// listenFD creates a new fcgiListener on an already open socket.
 // fd is the file descriptor of the open socket.
-func ListenFD(fd int) (net.Listener, os.Error) {
-	ret, err := listen("exec", NewFDListener(fd))
+func listenFD(fd int) (net.Listener, os.Error) {
+	ret, err := listen("exec", newFDListener(fd))
 	return ret, err
 }
 
@@ -466,23 +463,23 @@ func (self *rsConn) String() string {
 	return fmt.Sprint("{rsConn@", self.localAddr.String(), " reqId:", self.reqId, " read buffer:", self.buf.Len(), "}")
 }
 
-// FDListener is a net.Listener that uses syscall.Accept(fd)
+// fdListener is a net.Listener that uses syscall.Accept(fd)
 // to accept new connections directly on an already open fd.
 // This is needed by FCGI because if we are dynamically spawned,
 // the webserver will open the socket for us.
-type FDListener struct {
+type fdListener struct {
 	fd int
 }
 
-// ListenFD creates an FDListener, which listens on the given fd.
+// listenFD creates an fdListener, which listens on the given fd.
 // fd must refer to an already open socket
-func NewFDListener(fd int) *FDListener { return &FDListener{fd: fd} }
+func newFDListener(fd int) *fdListener { return &fdListener{fd: fd} }
 
 // Accept() blocks until a new connection is available on our fd
-// returns a FileConn as a net.Conn for Listener interface
-func (self *FDListener) Accept() (c net.Conn, err os.Error) {
+// returns a fileConn as a net.Conn for Listener interface
+func (self *fdListener) Accept() (c net.Conn, err os.Error) {
 	if nfd, _, e := syscall.Accept(self.fd); e == 0 {
-		c = FileConn{os.NewFile(nfd, "<fd:"+strconv.Itoa(self.fd)+">")}
+		c = fileConn{os.NewFile(nfd, "<fd:"+strconv.Itoa(self.fd)+">")}
 	} else {
 		err = os.NewError("Syscall error:" + strconv.Itoa(e))
 	}
@@ -492,37 +489,37 @@ func (self *FDListener) Accept() (c net.Conn, err os.Error) {
 // Close() closes the fd
 // in the context of fcgi, a webserver's response to this is undefined, it may terminate our process
 // but in any case, this process will no longer accept new connections from the webserver
-func (self *FDListener) Close() os.Error {
+func (self *fdListener) Close() os.Error {
 	if err := syscall.Close(self.fd); err == 0 {
 		return os.NewError("Syscall.Close error:" + strconv.Itoa(err))
 	}
 	return nil
 }
-func (self *FDListener) Addr() net.Addr { return &FDAddr{Fd: self.fd} }
+func (self *fdListener) Addr() net.Addr { return &FDAddr{Fd: self.fd} }
 
 // In order to Accept() new connections from an fd, we need some wrappers:
 
-// FileConn takes an os.File and provides a net.Conn interface
-type FileConn struct {
+// fileConn takes an os.File and provides a net.Conn interface
+type fileConn struct {
 	*os.File
 }
 
-func (f FileConn) LocalAddr() net.Addr  { return FDAddr{Fd: f.Fd()} }
-func (f FileConn) RemoteAddr() net.Addr { return FileAddr{Path: f.Name()} }
-func (f FileConn) SetTimeout(ns int64) os.Error {
+func (f fileConn) LocalAddr() net.Addr  { return FDAddr{Fd: f.Fd()} }
+func (f fileConn) RemoteAddr() net.Addr { return FileAddr{Path: f.Name()} }
+func (f fileConn) SetTimeout(ns int64) os.Error {
 	return nil
 }
-func (f FileConn) SetReadTimeout(ns int64) os.Error {
+func (f fileConn) SetReadTimeout(ns int64) os.Error {
 	return nil
 }
-func (f FileConn) SetWriteTimeout(ns int64) os.Error {
+func (f fileConn) SetWriteTimeout(ns int64) os.Error {
 	return nil
 }
-func (f FileConn) String() string {
+func (f fileConn) String() string {
 	return fmt.Sprint("{fileConn@ fd:", f.Fd(), " name:", f.Name(), "}")
 }
 
-// FileAddr is the "address" when we are connected to a FileConn,
+// FileAddr is the "address" when we are connected to a fileConn,
 // the path to the file (or the name passed to Open() if an fd file)
 type FileAddr struct {
 	Path string

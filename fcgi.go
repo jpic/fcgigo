@@ -2,17 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-/* This package implements FastCGI for use with the builtin http module.
+/*
+This package implements FastCGI for use with http.Serve().  It provides two main pieces: fcgi.Handler and fcgi.Listener.
 
-It provides two main pieces: fcgi.Handler and fcgi.Listener
+fcgi.Handler returns a http.Handler that will do round-robin dispatch to remote FastCGI Responders to handle each request. You create one by calling fcgi.Handler().
 
-fcgi.Handler returns a http.Handler that will do round-robin dispatch to remote FastCGI Responders to handle each request.
-
- - You create one directly: http.Handle("/", fcgi.Handler(...)).  See example for details.
-
-fcgi.Listener is a net.Listener that you can pass to http.Serve to produce a FastCGI Responder.
-
- - You get one by calling fcgi.Listen(), or fcgi.ListenFD().  See example and tests for details.
+fcgi.Listener is a net.Listener that you can pass to http.Serve() to produce a FastCGI Responder. You get one by calling fcgi.Listen().  See example and tests for details.
 
 Example: You want a create a FastCGI responder that a webserver can connect to via a TCP socket.
 
@@ -29,7 +24,7 @@ Example: You want a create a FastCGI responder that a webserver can connect to v
 
 	func main() {
 		http.Handle("/hello", http.HandlerFunc(HelloServer))
-		if listen, err := fcgi.Listen("0.0.0.0:7134"); err == nil {
+		if listen, err := fcgi.Listen("tcp", "0.0.0.0:7134"); err == nil {
 			http.Serve(listen, nil)
 		}
 	}
@@ -37,7 +32,7 @@ Example: You want a create a FastCGI responder that a webserver can connect to v
 Now, if you configured lighttpd to connect to ( "host" => "127.0.0.1", "port" => 7134 ),
 It will serve your hello, world application.
 
-Example: You want to create an application that can be spawned to service FastCGI requests.
+Example: You want to create an application that can be spawned by the webserver to service FastCGI requests.
 
 	package main
 
@@ -47,40 +42,35 @@ Example: You want to create an application that can be spawned to service FastCG
 	)
 
 	func main() {
-		if listen, err := fcgi.ListenFD(0); err == nil {
+		if listen, err := fcgi.Listen("exec", ""); err == nil {
 			http.Serve(listen, nil)
 		}
 	}
 
+Now, if you configured lighttpd to use ("bin-path" => "<path_to_your_executable>"), it will serve your hello, world application.
+
 Example: You have an existing FastCGI application running on a TCP host and want Go's http.Serve to send requests to it for servicing.
 
 	http.Handle("/", fcgi.Handler([]string{
-		"127.0.0.1:7134",
-		"127.0.0.1:7135",
+		"tcp://127.0.0.1:7134",
+		"tcp://127.0.0.1:7135",
 		// ... repeat for each responder ...
 	}))
 	http.ListenAndServe(":80", nil)
 
 Example: You want to serve static files, or errors, or anything, immediately, while sending only some other requests to a FastCGI Responder.
 
-	http.Handle("/", fcgi.Handler([]string{
+	http.Handle("/myapp", fcgi.Handler([]string{
 		// ... as above ...
 	}))
 	http.Handle("/static", http.FileServer(...))
 	http.ListenAndServe(":80", nil)
 
-In this example, the http server will use the FileServer to serve files from /static immediately, but all other requests will be sent along to the Responder.
+In this example, the http server will use the FileServer to serve files from /static locally, but all other requests will be sent along to the Responder.
 
-See fcgi_test.go for examples of how to use both the Handler and Listener in the same process.
+See fcgi_test.go for examples of all the Listener and Handler types; also, how to use both a Handler and Listener in the same process.
 (hint: they cannot share the same default muxer).
 
-Future Work:
-
-There should be a variant of fcgi.Handler that can use ForkAndExec to dynamically spawn another process,
-and connect to it over an FD.  fcgi.ListenFD is in place to provide support for accepting connections this way, would be nice to be able to produce them.
-Also, this would allow Go to run PHP applications as FastCGI responders.
-
-There should be variants of Handler and Listener that support net.UnixConn
 */
 package fcgi
 
@@ -100,7 +90,7 @@ import (
 
 // Log is the logging function used throughout this package.
 // By default, it will log nothing.  But, if you set this to log.Stderr, or some other logger that you create, it will use that as well.
-var Log = log.Stderr
+var Log = dontLog
 var _ = log.Stderr // reference this so it wont complain about imports
 
 func dontLog(k string, v ...) {}
