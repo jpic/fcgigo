@@ -26,7 +26,7 @@ func main() {
 		io.WriteString(conn, "connection test")
 	}))
 	// for testing the serving of static files
-	http.Handle("/static/", http.FileServer("/tmp", "/static"))
+	http.Handle("/static/", http.FileServer(".", "/static"))
 	if listen, err := fcgi.Listen(*net, *bind); err == nil {
 		http.Serve(listen, nil)
 	}

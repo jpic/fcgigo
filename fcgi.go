@@ -51,18 +51,20 @@ Now, if you configured lighttpd to use ("bin-path" => "<path_to_your_executable>
 
 Example: You have an existing FastCGI application running on a TCP host and want Go's http.Serve to send requests to it for servicing.
 
-	http.Handle("/", fcgi.Handler([]string{
+	handler, err := fcgi.Handler([]string{
 		"tcp://127.0.0.1:7134",
 		"tcp://127.0.0.1:7135",
 		// ... repeat for each responder ...
-	}))
+	})
+	http.Handle("/", handler)
 	http.ListenAndServe(":80", nil)
 
 Example: You want to serve static files, or errors, or anything, immediately, while sending only some other requests to a FastCGI Responder.
 
-	http.Handle("/myapp", fcgi.Handler([]string{
+	handler, err := fcgi.Handler([]string{
 		// ... as above ...
-	}))
+	})
+	http.Handle("/myapp", handler)
 	http.Handle("/static", http.FileServer(...))
 	http.ListenAndServe(":80", nil)
 
@@ -81,61 +83,58 @@ package fcgi
 import (
 	"os"
 	"io"
-	"net"
 	"encoding/binary"
 	"bytes"
 	"fmt"
-	"log"
 )
 
 // Log is the logging function used throughout this package.
 // By default, it will log nothing.  But, if you set this to log.Stderr, or some other logger that you create, it will use that as well.
 var Log = dontLog
-var _ = log.Stderr // reference this so it wont complain about imports
 
 func dontLog(k string, v ...) {}
 
 const (
 	// The fd to use when we are execed by the web-server
-	FCGI_LISTENSOCK_FILENO = iota
+	fcgiListenSockFileNo = iota
 
-	// Packet Types (fcgiHeader.Kind)
-	FCGI_BEGIN_REQUEST
-	FCGI_ABORT_REQUEST
-	FCGI_END_REQUEST
-	FCGI_PARAMS
-	FCGI_STDIN
-	FCGI_STDOUT
-	FCGI_STDERR
-	FCGI_DATA
-	FCGI_GET_VALUES
-	FCGI_GET_VALUES_RESULT
-	FCGI_UNKNOWN_TYPE
-	FCGI_MAXTYPE = FCGI_UNKNOWN_TYPE
+	// Packet Types (header.Kind)
+	fcgiBeginRequest
+	fcgiAbortRequest
+	fcgiEndRequest
+	fcgiParams
+	fcgiStdin
+	fcgiStdout
+	fcgiStderr
+	fcgiData
+	fcgiGetValues
+	fcgiGetValuesResult
+	fcgiUnknownType
+	fcgiMaxType = fcgiUnknownType
 )
 
 // Keep the connection between web-server and responder open after request
-const FCGI_KEEP_CONN = 1
+const fcgiKeepConn = 1
 
 // Max amount of data in a FastCGI record body
-const FCGI_MAX_WRITE = 65534
+const fcgiMaxWrite = 65535
 
-// Roles (fcgiBeginRequest.Roles)
+// Roles (beginRequest.Roles)
 const (
-	FCGI_RESPONDER = iota + 1 // only Responders are implemented.
-	FCGI_AUTHORIZER
-	FCGI_FILTER
+	fcgiResponder = iota + 1 // only Responders are implemented.
+	fcgiAuthorizer
+	fcgiFilter
 )
 
-// ProtocolStatus (in fcgiEndRequest)
+// ProtocolStatus (in endRequest)
 const (
-	FCGI_REQUEST_COMPLETE = iota
-	FCGI_CANT_MPX_CONN
-	FCGI_OVERLOADED
-	FCGI_UNKNOWN_ROLE
+	fcgiRequestComplete = iota
+	fcgiCantMpxConn
+	fcgiOverloaded
+	fcgiUnknownRole
 )
 
-type fcgiHeader struct {
+type header struct {
 	Version       uint8
 	Kind          uint8
 	ReqId         uint16
@@ -143,19 +142,19 @@ type fcgiHeader struct {
 	PaddingLength uint8
 	Reserved      uint8
 }
-type fcgiEndRequest struct {
+type endRequest struct {
 	AppStatus      uint32
 	ProtocolStatus uint8
 	Reserved       [3]uint8
 }
-type fcgiBeginRequest struct {
+type beginRequest struct {
 	Role     uint16
 	Flags    uint8
 	Reserved [5]uint8
 }
 
-func newFcgiHeader(kind uint8, id uint16, content_length int) *fcgiHeader {
-	return &fcgiHeader{
+func newHeader(kind uint8, id uint16, content_length int) *header {
+	return &header{
 		Version: 1,
 		Kind: kind,
 		ReqId: id,
@@ -165,7 +164,7 @@ func newFcgiHeader(kind uint8, id uint16, content_length int) *fcgiHeader {
 }
 
 // this will read ContentLength+PaddingLength bytes, and return the first ContentLength bytes
-func (self *fcgiHeader) readContent(r io.Reader) (b []byte, err os.Error) {
+func (self *header) readContent(r io.Reader) (b []byte, err os.Error) {
 	t := int(self.ContentLength) + int(self.PaddingLength)
 	b = make([]byte, t)
 	if t == 0 {
@@ -191,8 +190,9 @@ func (self *fcgiHeader) readContent(r io.Reader) (b []byte, err os.Error) {
 }
 
 // so we dont have to allocate new ones all the time, these are always zero, and we write slices of it for padding
-var paddingSource = make([]byte, 7) // packets are padded to 8-bytes, so if we are padding more than 7 its wasted
-func (self *fcgiHeader) writePadding(w io.Writer) os.Error {
+var paddingSource = make([]byte, 256)
+
+func (self *header) writePadding(w io.Writer) os.Error {
 	p := self.PaddingLength
 	if p > 0 {
 		if p > 7 {
@@ -208,7 +208,7 @@ func (self *fcgiHeader) writePadding(w io.Writer) os.Error {
 
 // fcgiWrite() writes a single FastCGI record to a Writer
 func fcgiWrite(conn io.Writer, kind uint8, reqId uint16, b []byte) (n int, err os.Error) {
-	h := newFcgiHeader(kind, reqId, len(b))
+	h := newHeader(kind, reqId, len(b))
 	// Log("fcgiWrite: Header", conn, h)
 	writeStruct(conn, h)
 	if len(b) > 0 {
@@ -255,7 +255,7 @@ func encodeSize(size int) []byte {
 }
 
 // when the webserver sends us "ACCEPT_ENCODING" as a header,
-// (in the FCGI_PARAMS) standardize it like: Accept-Encoding
+// (in the fcgiParams) standardize it like: Accept-Encoding
 func standardCase(str []byte) string {
 	ret := make([]byte, len(str))
 	first := true
@@ -297,27 +297,6 @@ type nopCloser struct {
 }
 
 func (nopCloser) Close() os.Error { return nil }
-
-// a quick wrapper for DialTCP that handles name resolution
-func dialTcpAddr(addr string) (conn *net.TCPConn, err os.Error) {
-	laddr, _ := net.ResolveTCPAddr("127.0.0.1:0") // our source addr is any available local one
-	if raddr, err := net.ResolveTCPAddr(addr); err == nil {
-		if sock, err := net.DialTCP("tcp", laddr, raddr); err == nil {
-			conn = sock
-		}
-	}
-	return conn, err
-}
-
-// a quick wrapper for DialUnix that handles name resolution
-func dialUnixAddr(addr string) (conn *net.UnixConn, err os.Error) {
-	if raddr, err := net.ResolveUnixAddr("unix", addr); err == nil {
-		if sock, err := net.DialUnix("unix", nil, raddr); err == nil {
-			conn = sock
-		}
-	}
-	return conn, err
-}
 
 // copied from http.request
 // this does the atoi conversion at different offsets i in s

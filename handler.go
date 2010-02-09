@@ -12,8 +12,9 @@ import (
 	"io/ioutil"
 	"bufio"
 	"bytes"
-	"http"
 	"strings"
+	"net"
+	"http"
 	"fmt"
 	"syscall"
 	"path"
@@ -23,7 +24,7 @@ import (
 // Handler returns an http.Handler that will dispatch requests to FastCGI Responders
 // addrs are a list of addresses that include a prefix for what kind of network they are on
 // e.g. tcp://127.0.0.1:1234, unix:///tmp/some.sock, exec:///usr/bin/php
-func Handler(addrs []string) http.Handler {
+func Handler(addrs []string) (http.Handler, os.Error) {
 	// first, connect to all the addrs
 	responders := make([]*wsConn, len(addrs))
 	e := 0 // number of connection errors
@@ -31,14 +32,12 @@ func Handler(addrs []string) http.Handler {
 		var err os.Error
 		s := strings.Split(addr, "://", 0)
 		if len(s) != 2 {
-			// even on fatal errors, always do our best to return some kind of handler
-			return errorHandler(http.StatusInternalServerError, fmt.Sprint("Invalid address given to fcgi.Handler()", addr))
+			return nil, os.NewError(fmt.Sprint("Invalid address given to fcgi.Handler()", addr))
 		}
 		switch strings.ToLower(s[0]) {
 		case "tcp":
 			if responders[i], err = fcgiDialTcp(s[1]); err != nil || responders[i] == nil {
 				Log("Handler: failed to connect to tcp responder:", s[1], err)
-				// on non-fatal (to the whole Handler) errors just make a note for a little later
 				e += 1
 			}
 		case "unix":
@@ -52,13 +51,13 @@ func Handler(addrs []string) http.Handler {
 				e += 1
 			}
 		default:
-			return errorHandler(http.StatusInternalServerError, fmt.Sprint("Invalid responder address", addr, "with unknown protocol", s[0]))
+			return nil, os.NewError(fmt.Sprint("Invalid responder address", addr, "with unknown protocol", s[0]))
 		}
 	}
 	// collapse the list of responders, removing connection errors
 	if e > 0 {
 		if e == len(responders) {
-			return errorHandler(http.StatusServiceUnavailable, "No FastCGIResponders connected.")
+			return nil, os.NewError("No FastCGIResponders connected.")
 		}
 		tmp := make([]*wsConn, len(responders)-e)
 		j := 0
@@ -71,7 +70,7 @@ func Handler(addrs []string) http.Handler {
 		responders = tmp
 	}
 	if len(responders) == 0 {
-		return errorHandler(http.StatusServiceUnavailable, "No FastCGIResponders connected.")
+		return nil, os.NewError("No FastCGIResponders connected.")
 	}
 
 	// define an iterator for the responders
@@ -86,30 +85,37 @@ func Handler(addrs []string) http.Handler {
 
 	// then, define the handler
 	handler := http.HandlerFunc(func(conn *http.Conn, req *http.Request) {
-		responder := getNextResponder()
-		if responder != nil {
-			reqid := responder.WriteRequest(conn, req)
-			// read the response (blocking)
-			if response, err := responder.ReadResponse(reqid, req.Method); err == nil {
-				// once it is ready, write it out to the real connection
-				for k, v := range response.Header {
-					conn.SetHeader(k, v)
-				}
-				conn.WriteHeader(response.StatusCode)
-				if b, err := ioutil.ReadAll(response.Body); err == nil {
-					conn.Write(b)
-				}
-			} else {
-				Log("Handler: Failed to read response: ", err)
-				conn.WriteHeader(http.StatusInternalServerError)
-			}
-		} else {
+		var response *http.Response
+		var err os.Error
+		var body []byte
+		var responder *wsConn = getNextResponder()
+		if responder == nil {
 			Log("Handler: getNextResponder() is nil, must be overloaded.")
 			conn.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
+		reqid := responder.WriteRequest(conn, req)
+		// read the response (blocking)
+		if response, err = responder.ReadResponse(reqid, req.Method); err != nil {
+			Log("Handler: Failed to read response: ", err)
+			conn.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(conn, err.String())
+			return
+		}
+		// once it is ready, write it out to the real connection
+		for k, v := range response.Header {
+			conn.SetHeader(k, v)
+		}
+		conn.WriteHeader(response.StatusCode)
+		if body, err = ioutil.ReadAll(response.Body); err != nil {
+			Log("Handler: Error reading response.Body:", err)
+			io.WriteString(conn, err.String())
+			return
+		}
+		conn.Write(body)
 	})
 
-	return handler
+	return handler, nil
 }
 
 // errorHandler returns an http.Handler that prints an error page
@@ -152,7 +158,7 @@ func newWsConn(conn io.ReadWriteCloser, addr string) *wsConn {
 
 // fcgiDialTcp connects to a FastCGI Responder over TCP, and returns the wsConn for the connection
 func fcgiDialTcp(addr string) (self *wsConn, err os.Error) {
-	if conn, err := dialTcpAddr(addr); err == nil {
+	if conn, err := net.Dial("tcp", ":0", addr); err == nil {
 		self = newWsConn(conn, addr)
 	}
 	return self, err
@@ -160,7 +166,7 @@ func fcgiDialTcp(addr string) (self *wsConn, err os.Error) {
 
 // fcgiDialUnix connects to a FastCGI Responder over a Unix socket, and returns the wsConn for the connection
 func fcgiDialUnix(addr string) (self *wsConn, err os.Error) {
-	if conn, err := dialUnixAddr(addr); err == nil {
+	if conn, err := net.Dial("unix", "", addr); err == nil {
 		self = newWsConn(conn, addr)
 	}
 	return self, err
@@ -179,63 +185,55 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 			return nil, err
 		}
 	}
+	var fd, pid, cfd, errno int
+	var sa syscall.Sockaddr
 	// we can almost use UnixListener to do this except it doesn't expose the fd it's listening on
 	// create a new socket
-	if fd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
-		// i dont know why you would do this for a unix socket, but lighttpd does it
-		if errno := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); errno == 0 {
-			// bind the new socket to socketPath
-			if errno := syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); errno == 0 {
-				// start to listen on that socket
-				if errno := syscall.Listen(fd, listenBacklog); errno == 0 {
-					dir, file := path.Split(binpath)
-					// then ForkExec a new process, and give this listening socket to them as stdin
-					if pid, errno := syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno == 0 {
-						// now create a socket for the client-side of the connection
-						if cfd, errno := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno == 0 {
-							// find the address of the socket we gave the new process
-							if sa, errno := syscall.Getsockname(fd); errno == 0 {
-								// connect our client side to the remote address
-								if errno := syscall.Connect(cfd, sa); errno == 0 {
-									// return a wrapper around the client side of this connection
-									// Log("Handler: returning new wsConn connected to process", binpath)
-									ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
-									ws.pid = pid
-									runtime.SetFinalizer(ws, finalizer)
-									return ws, nil
-								} else {
-									Log("Connect failed:", syscall.Errstr(errno))
-									return nil, os.NewError(fmt.Sprint("Connect failed:", syscall.Errstr(errno)))
-								}
-							} else {
-								Log("Getsockname failed:", syscall.Errstr(errno))
-								return nil, os.NewError(fmt.Sprint("Getsockname failed:", syscall.Errstr(errno)))
-							}
-						} else {
-							Log("Creating new socket on webserver failed:", syscall.Errstr(errno))
-							return nil, os.NewError(fmt.Sprint("Creating new socket on webserver failed:", syscall.Errstr(errno)))
-						}
-					} else {
-						Log("ForkExec failed:", syscall.Errstr(errno))
-						return nil, os.NewError(fmt.Sprint("ForkExec failed:", syscall.Errstr(errno)))
-					}
-				} else {
-					Log("Listen failed:", syscall.Errstr(errno))
-					return nil, os.NewError(fmt.Sprint("Listen failed:", syscall.Errstr(errno)))
-				}
-			} else {
-				Log("Bind failed:", syscall.Errstr(errno))
-				return nil, os.NewError(fmt.Sprint("Bind failed:", syscall.Errstr(errno)))
-			}
-		} else {
-			Log("Setsockopt failed:", syscall.Errstr(errno))
-			return nil, os.NewError(fmt.Sprint("Setsockopt failed:", syscall.Errstr(errno)))
-		}
-	} else {
+	if fd, errno = syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno != 0 {
 		Log("Creating first new socket failed:", syscall.Errstr(errno))
 		return nil, os.NewError(fmt.Sprint("Creating first new socket failed:", syscall.Errstr(errno)))
 	}
-	panic()
+	// i dont know why you would do this for a unix socket, but lighttpd does it
+	if errno = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); errno != 0 {
+		Log("Setsockopt failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Setsockopt failed:", syscall.Errstr(errno)))
+	}
+	// bind the new socket to socketPath
+	if errno = syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); errno != 0 {
+		Log("Bind failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Bind failed:", syscall.Errstr(errno)))
+	}
+	// start to listen on that socket
+	if errno = syscall.Listen(fd, listenBacklog); errno != 0 {
+		Log("Listen failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Listen failed:", syscall.Errstr(errno)))
+	}
+	dir, file := path.Split(binpath)
+	// then ForkExec a new process, and give this listening socket to them as stdin
+	if pid, errno = syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno != 0 {
+		Log("ForkExec failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("ForkExec failed:", syscall.Errstr(errno)))
+	}
+	// now create a socket for the client-side of the connection
+	if cfd, errno = syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno != 0 {
+		Log("Creating new socket on webserver failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Creating new socket on webserver failed:", syscall.Errstr(errno)))
+	}
+	// find the address of the socket we gave the new process
+	if sa, errno = syscall.Getsockname(fd); errno != 0 {
+		Log("Getsockname failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Getsockname failed:", syscall.Errstr(errno)))
+	}
+	// connect our client side to the remote address
+	if errno = syscall.Connect(cfd, sa); errno != 0 {
+		Log("Connect failed:", syscall.Errstr(errno))
+		return nil, os.NewError(fmt.Sprint("Connect failed:", syscall.Errstr(errno)))
+	}
+	// return a wrapper around the client side of this connection
+	ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
+	ws.pid = pid
+	runtime.SetFinalizer(ws, finalizer)
+	return ws, nil
 }
 
 // finalizer will be passed to runtime.SetFinalizer, and be used to kill the child process this connection created
@@ -267,9 +265,9 @@ func (self *wsConn) fcgiWrite(kind uint8, id uint16, data []byte) (n int, err os
 }
 
 // readAllPackets is a goroutine that reads everything from the connection
-// and dispatches responses when they are complete (FCGI_END_REQUEST is recieved).
+// and dispatches responses when they are complete (fcgiEndRequest is recieved).
 func (self *wsConn) readAllPackets() {
-	h := &fcgiHeader{}
+	h := &header{}
 	for {
 		h.Version = 0
 		err := readStruct(self.conn, h)
@@ -288,7 +286,7 @@ func (self *wsConn) readAllPackets() {
 			continue
 		} else {
 			switch h.Kind {
-			case FCGI_STDOUT:
+			case fcgiStdout:
 				if content, err := h.readContent(self.conn); err == nil {
 					// Log("wsConn: got STDOUT:", strconv.Quote(string(content)))
 					if len(content) > 0 {
@@ -297,7 +295,7 @@ func (self *wsConn) readAllPackets() {
 						req.Close()
 					}
 				}
-			case FCGI_STDERR:
+			case fcgiStderr:
 				if content, err := h.readContent(self.conn); err == nil {
 					// Log("wsConn: got STDERR:", strconv.Quote(string(content)))
 					if len(content) > 0 {
@@ -306,22 +304,22 @@ func (self *wsConn) readAllPackets() {
 						req.WriteString("\r\n")
 					}
 				}
-			case FCGI_END_REQUEST:
+			case fcgiEndRequest:
 				Log("wsConn: got END_REQUEST", h.ReqId)
-				e := new(fcgiEndRequest)
+				e := new(endRequest)
 				readStruct(self.conn, e)
 				// Log("wsConn: appStatus", e.AppStatus, "protocolStatus", e.ProtocolStatus)
 				buf := self.buffers[h.ReqId]
 				switch e.ProtocolStatus {
-				case FCGI_REQUEST_COMPLETE:
+				case fcgiRequestComplete:
 					// buf has been filled already by calls to .Write from inside some other Handler
-				case FCGI_CANT_MPX_CONN:
+				case fcgiCantMpxConn:
 					buf.Reset()
 					buf.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder says it cannot multiplex connections.\r\n")
-				case FCGI_OVERLOADED:
+				case fcgiOverloaded:
 					buf.Reset()
 					buf.WriteString("HTTP/1.1 503 Service Unavailable\r\n\r\nFastCGI Responder says it is overloaded.\r\n")
-				case FCGI_UNKNOWN_ROLE:
+				case fcgiUnknownRole:
 					buf.Reset()
 					buf.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder has been asked for an unknown role.\r\n")
 				}
@@ -367,65 +365,65 @@ func (self *wsConn) freeReqId(reqid uint16) {
 // It returns the new request id allocated for use in the exchange.
 func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint16) {
 	reqid = self.getNextReqId()
-	freq := getFcgiRequest(reqid, con, req)
+	freq := getRequest(reqid, con, req)
 	self.buffers[reqid] = new(closeBuffer)
 	Log("wsConn: sending BEGIN_REQUEST", reqid)
-	/* Send a FCGI_BEGIN_REQUEST */
-	writeStruct(self.conn, newFcgiHeader(FCGI_BEGIN_REQUEST, reqid, 8))
+	/* Send a fcgiBeginRequest */
+	writeStruct(self.conn, newHeader(fcgiBeginRequest, reqid, 8))
 	// default to keeping the fcgi connection open
-	flags := uint8(FCGI_KEEP_CONN)
+	flags := uint8(fcgiKeepConn)
 	// unless requested otherwise by the http.Request
 	if req.Close {
 		flags = 0
 	}
-	writeStruct(self.conn, fcgiBeginRequest{
-		Role: FCGI_RESPONDER,
+	writeStruct(self.conn, beginRequest{
+		Role: fcgiResponder,
 		Flags: flags,
 	})
-	/* Encode and Send the FCGI_PARAMS */
-	buf := bytes.NewBuffer(make([]byte, 0, FCGI_MAX_WRITE))
+	/* Encode and Send the fcgiParams */
+	buf := bytes.NewBuffer(make([]byte, 0, fcgiMaxWrite))
 	for k, v := range freq.params {
 		buf.Write(encodeSize(len(k)))
 		buf.Write(encodeSize(len(v)))
 		buf.WriteString(k)
 		buf.WriteString(v)
 	}
-	// Log("wsConn: sending FCGI_PARAMS")
-	self.fcgiWrite(FCGI_PARAMS, reqid, buf.Bytes())
-	buf2 := make([]byte, 0, FCGI_MAX_WRITE)
-	/* Now write the FCGI_STDIN, read from the Body of the request */
-	// Log("wsConn: sending FCGI_STDIN")
-	// get the stdin data from the fcgiRequest
+	// Log("wsConn: sending fcgiParams")
+	self.fcgiWrite(fcgiParams, reqid, buf.Bytes())
+	buf2 := make([]byte, 0, fcgiMaxWrite)
+	/* Now write the fcgiStdin, read from the Body of the request */
+	// Log("wsConn: sending fcgiStdin")
+	// get the stdin data from the request
 	for freq.stdin != nil && freq.stdin.Len() > 0 {
 		n, err := freq.stdin.Read(buf2[0:])
 		if n == 0 || err == os.EOF {
 			break
 		} else if err != nil {
-			Log("wsConn: Error reading fcgiRequest.stdin:", err)
+			Log("wsConn: Error reading request.stdin:", err)
 			break
 		} else {
-			// Log("wsConn: sending FCGI_STDIN")
-			self.fcgiWrite(FCGI_STDIN, reqid, buf2[0:n])
+			// Log("wsConn: sending fcgiStdin")
+			self.fcgiWrite(fcgiStdin, reqid, buf2[0:n])
 		}
 	}
-	// write the last FCGI_STDIN
-	self.fcgiWrite(FCGI_STDIN, reqid, []byte{})
-	/* Send the FCGI_DATA */
-	// Log("wsConn: sending FCGI_DATA")
+	// write the last fcgiStdin
+	self.fcgiWrite(fcgiStdin, reqid, []byte{})
+	/* Send the fcgiData */
+	// Log("wsConn: sending fcgiData")
 	for freq.data != nil && freq.data.Len() > 0 {
 		n, err := freq.data.Read(buf2[0:])
 		if n == 0 || err == os.EOF {
 			break
 		} else if err != nil {
-			Log("Error reading fcgiRequest.data:", err)
+			Log("Error reading request.data:", err)
 			break
 		} else {
-			// Log("wsConn: sending FCGI_DATA")
-			self.fcgiWrite(FCGI_DATA, reqid, buf2[0:n])
+			// Log("wsConn: sending fcgiData")
+			self.fcgiWrite(fcgiData, reqid, buf2[0:n])
 		}
 	}
-	// write the last FCGI_DATA
-	self.fcgiWrite(FCGI_DATA, reqid, []byte{})
+	// write the last fcgiData
+	self.fcgiWrite(fcgiData, reqid, []byte{})
 	return reqid
 }
 

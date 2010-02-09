@@ -1,3 +1,7 @@
+# Copyright 2010 The Go Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 include ../../../Make.$(GOARCH)
 
 TARG=http/fcgi
@@ -11,6 +15,6 @@ include $(GOROOT)/src/Make.pkg
 fmt:
 	gofmt -w *.go
 
-%.out: %.go
+_test/listener_test_exec.out: listener_test_exec.go
 	$(QUOTED_GOBIN)/$(GC) -I _test -o $@.$(O) $<
 	$(QUOTED_GOBIN)/$(LD) -L _test -o $@ $@.$(O)
