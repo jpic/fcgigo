@@ -150,6 +150,7 @@ func runTest(test testRecord, j int, webaddr string, t *testing.T) {
 }
 
 // Build the test executable needed for the exec handler
+// gotest: mkdir -p _test
 // gotest: make _test/listener_test_exec.out
 func TestRunTests(t *testing.T) {
 	tcplisten, unixlisten, weblisten := startAllServers(t)
