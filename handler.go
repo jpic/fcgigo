@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"bytes"
 	"strings"
+	"strconv"
 	"net"
 	"http"
 	"fmt"
@@ -21,123 +22,112 @@ import (
 	"runtime"
 )
 
+type handler struct {
+	http.Handler
+	responders chan *wsConn
+}
+
 // Handler returns an http.Handler that will dispatch requests to FastCGI Responders
 // addrs are a list of addresses that include a prefix for what kind of network they are on
 // e.g. tcp://127.0.0.1:1234, unix:///tmp/some.sock, exec:///usr/bin/php
 func Handler(addrs []string) (http.Handler, os.Error) {
-	// first, connect to all the addrs
-	responders := make([]*wsConn, len(addrs))
+	self := &handler{
+		responders: make(chan *wsConn, len(addrs)), // make room to buffer all of the responders if we are idle
+	}
+	// first, connect to all the addrs, and load the responders in the channel
 	e := 0 // number of connection errors
-	for i, addr := range addrs {
-		var err os.Error
+	for _, addr := range addrs {
 		s := strings.Split(addr, "://", 0)
 		if len(s) != 2 {
 			return nil, os.NewError(fmt.Sprint("Invalid address given to fcgi.Handler()", addr))
 		}
 		switch strings.ToLower(s[0]) {
 		case "tcp":
-			if responders[i], err = fcgiDialTcp(s[1]); err != nil || responders[i] == nil {
+			conn, err := net.Dial("tcp", "", s[1])
+			if err != nil {
 				Log("Handler: failed to connect to tcp responder:", s[1], err)
 				e += 1
+				continue
 			}
+			Log("Handler: connected to TCP responder.", s[1])
+			self.responders <- newWsConn(conn, s[1])
 		case "unix":
-			if responders[i], err = fcgiDialUnix(s[1]); err != nil || responders[i] == nil {
+			conn, err := net.Dial("unix", "", s[1])
+			if err != nil {
 				Log("Handler: failed to connect to responder on unix socket:", s[1], err)
 				e += 1
+				continue
 			}
+			Log("Handler: connected to UNIX responder.", s[1])
+			self.responders <- newWsConn(conn, s[1])
 		case "exec":
-			if responders[i], err = fcgiDialExec(s[1]); err != nil || responders[i] == nil {
+			conn, err := fcgiDialExec(s[1])
+			if err != nil {
 				Log("Handler: failed to exec fcgi responder program:", s[1], err)
 				e += 1
+				continue
 			}
+			Log("Handler: connected to EXEC responder.", s[1])
+			self.responders <- conn
 		default:
 			return nil, os.NewError(fmt.Sprint("Invalid responder address", addr, "with unknown protocol", s[0]))
 		}
 	}
-	// collapse the list of responders, removing connection errors
-	if e > 0 {
-		if e == len(responders) {
-			return nil, os.NewError("No FastCGIResponders connected.")
-		}
-		tmp := make([]*wsConn, len(responders)-e)
-		j := 0
-		for i, _ := range responders {
-			if responders[i] != nil {
-				tmp[j] = responders[i]
-				j += 1
-			}
-		}
-		responders = tmp
-	}
-	if len(responders) == 0 {
+	if e == len(addrs) {
 		return nil, os.NewError("No FastCGIResponders connected.")
 	}
+	return self, nil
+}
 
-	// define an iterator for the responders
-	// (round-robin for now)
-	nextId := -1 // -1 so the iterator yields 0 first
-	getNextResponder := func() *wsConn {
-		nextId = (nextId + 1) % len(responders)
-		ret := responders[nextId]
-		Log("Handler: getNextResponder() ->", nextId, ret)
-		return ret
+func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
+	var response *http.Response
+	var err os.Error
+	var body []byte
+	// get the next available responder
+	responder := <-self.responders
+	// a multiplexing responder is available again immediately
+	if responder.multiplex {
+		self.responders <- responder
 	}
-
-	// then, define the handler
-	handler := http.HandlerFunc(func(conn *http.Conn, req *http.Request) {
-		var response *http.Response
-		var err os.Error
-		var body []byte
-		var responder *wsConn = getNextResponder()
-		if responder == nil {
-			Log("Handler: getNextResponder() is nil, must be overloaded.")
-			conn.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		reqid := responder.WriteRequest(conn, req)
-		// read the response (blocking)
-		if response, err = responder.ReadResponse(reqid, req.Method); err != nil {
-			Log("Handler: Failed to read response: ", err)
-			conn.WriteHeader(http.StatusInternalServerError)
-			io.WriteString(conn, err.String())
-			return
-		}
-		// once it is ready, write it out to the real connection
-		for k, v := range response.Header {
-			conn.SetHeader(k, v)
-		}
-		conn.WriteHeader(response.StatusCode)
-		if body, err = ioutil.ReadAll(response.Body); err != nil {
-			Log("Handler: Error reading response.Body:", err)
-			io.WriteString(conn, err.String())
-			return
-		}
-		conn.Write(body)
-	})
-
-	return handler, nil
+	// send the request to the FastCGI responder
+	reqid := responder.WriteRequest(conn, req)
+	// read the response (blocking)
+	if response, err = responder.ReadResponse(reqid, req.Method); err != nil {
+		Log("Handler: Failed to read response:", err)
+		conn.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(conn, err.String())
+		return
+	}
+	// a non-multiplexing responder has to wait until the response is fully read before it is available
+	if !responder.multiplex {
+		self.responders <- responder
+	}
+	// once response is ready, write it out to the real connection
+	for k, v := range response.Header {
+		conn.SetHeader(k, v)
+	}
+	conn.WriteHeader(response.StatusCode)
+	if body, err = ioutil.ReadAll(response.Body); err != nil {
+		Log("Handler: Error reading response.Body:", err)
+		io.WriteString(conn, err.String())
+		return
+	}
+	conn.Write(body)
 }
 
-// errorHandler returns an http.Handler that prints an error page
-func errorHandler(status int, msg string) http.Handler {
-	return http.HandlerFunc(func(c *http.Conn, r *http.Request) {
-		c.SetHeader("Content-type", "text/plain")
-		c.WriteHeader(status)
-		io.WriteString(c, msg)
-	})
-}
 
 // wsConn is the webserver-side of a connection to a FastCGI Responder
 type wsConn struct {
-	addr    string
-	pid     int // only meaningful when addr is exec://...
-	conn    io.ReadWriteCloser
-	buffers []*closeBuffer // a closable bytes.Buffer
-	signals []chan bool    // used to signal ReadResponse
-	nextId  uint16
+	addr      string
+	pid       int // only meaningful when addr is exec:...
+	conn      net.Conn
+	buffers   []*closeBuffer // a closable bytes.Buffer
+	signals   []chan bool    // used to signal ReadResponse
+	nextId    uint16         // the reqId of the next request on this connection
+	multiplex bool           // does the responder on the other side support multiplex?
 }
 
-func newWsConn(conn io.ReadWriteCloser, addr string) *wsConn {
+func newWsConn(conn net.Conn, addr string) *wsConn {
 	if conn == nil {
 		return nil
 	}
@@ -147,6 +137,7 @@ func newWsConn(conn io.ReadWriteCloser, addr string) *wsConn {
 		buffers: make([]*closeBuffer, 256),
 		signals: make([]chan bool, 256),
 		nextId: 1,
+		multiplex: true,
 	}
 	for i, _ := range self.signals {
 		self.signals[i] = make(chan bool, 1) // if the request completes before the ReadResponse, it shouldnt block
@@ -156,35 +147,32 @@ func newWsConn(conn io.ReadWriteCloser, addr string) *wsConn {
 	return self
 }
 
-// fcgiDialTcp connects to a FastCGI Responder over TCP, and returns the wsConn for the connection
-func fcgiDialTcp(addr string) (self *wsConn, err os.Error) {
-	if conn, err := net.Dial("tcp", ":0", addr); err == nil {
-		self = newWsConn(conn, addr)
-	}
-	return self, err
-}
-
-// fcgiDialUnix connects to a FastCGI Responder over a Unix socket, and returns the wsConn for the connection
-func fcgiDialUnix(addr string) (self *wsConn, err os.Error) {
-	if conn, err := net.Dial("unix", "", addr); err == nil {
-		self = newWsConn(conn, addr)
-	}
-	return self, err
-}
-
 // fcgiDialExec will ForkExec a new process, and returns a wsConn that connects to its stdin
 func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 	listenBacklog := 1024
-	socketPath := "/tmp/fcgiauto.sock" // TODO: should be dynamic
-	// if the socket file exists, we will get "already in use" when we bind.
-	// if its in use already, then the Remove will fail and propagate the error.
-	if err := os.Remove(socketPath); err != nil {
+	dir, file := path.Split(binpath)
+	socketPath := "/tmp/" + file + ".sock"
+	socketIndex := 0 // if the first socket is really in use (we are launching this same process more than once)
+	// then the socketIndex will start incrementing so we assign .sock-1 to the second process, etc
+	for {
+		err := os.Remove(socketPath)
+		// if the socket file is stale, but not in use, the Remove succeeds with no error
+		if err == nil {
+			goto haveSocket // success, found a stale socket we can re-use
+		}
+		// otherwise we have to check what the error was
 		switch err.String() {
-		case "remove " + socketPath + ": no such file or directory": // ignore, it will be created later in this case
+		case "remove " + socketPath + ": no such file or directory":
+			goto haveSocket // success, we have found an unused socket.
 		default:
-			return nil, err
+			// if its really in use, we start incrementing socketIndex
+			socketIndex += 1
+			socketPath = "/tmp/" + file + ".sock-" + strconv.Itoa(socketIndex)
+			Log("Socket was in use, trying:", socketPath)
 		}
 	}
+haveSocket:
+	Log("Using socketPath:", socketPath)
 	var fd, pid, cfd, errno int
 	var sa syscall.Sockaddr
 	// we can almost use UnixListener to do this except it doesn't expose the fd it's listening on
@@ -192,11 +180,6 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 	if fd, errno = syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0); errno != 0 {
 		Log("Creating first new socket failed:", syscall.Errstr(errno))
 		return nil, os.NewError(fmt.Sprint("Creating first new socket failed:", syscall.Errstr(errno)))
-	}
-	// i dont know why you would do this for a unix socket, but lighttpd does it
-	if errno = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); errno != 0 {
-		Log("Setsockopt failed:", syscall.Errstr(errno))
-		return nil, os.NewError(fmt.Sprint("Setsockopt failed:", syscall.Errstr(errno)))
 	}
 	// bind the new socket to socketPath
 	if errno = syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); errno != 0 {
@@ -208,7 +191,6 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 		Log("Listen failed:", syscall.Errstr(errno))
 		return nil, os.NewError(fmt.Sprint("Listen failed:", syscall.Errstr(errno)))
 	}
-	dir, file := path.Split(binpath)
 	// then ForkExec a new process, and give this listening socket to them as stdin
 	if pid, errno = syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno != 0 {
 		Log("ForkExec failed:", syscall.Errstr(errno))
@@ -230,7 +212,7 @@ func fcgiDialExec(binpath string) (self *wsConn, err os.Error) {
 		return nil, os.NewError(fmt.Sprint("Connect failed:", syscall.Errstr(errno)))
 	}
 	// return a wrapper around the client side of this connection
-	ws := newWsConn(os.NewFile(cfd, "exec://"+binpath), "exec://"+binpath)
+	ws := newWsConn(fileConn{os.NewFile(cfd, "exec://"+binpath)}, "exec://"+binpath)
 	ws.pid = pid
 	runtime.SetFinalizer(ws, finalizer)
 	return ws, nil
@@ -271,6 +253,8 @@ func (self *wsConn) readAllPackets() {
 	for {
 		h.Version = 0
 		err := readStruct(self.conn, h)
+
+		// check errors
 		switch {
 		case err == os.EOF:
 			goto close
@@ -281,57 +265,61 @@ func (self *wsConn) readAllPackets() {
 			Log("wsConn: read a header with invalid version", h.Version, h)
 			goto close
 		}
-		if req := self.buffers[h.ReqId]; req == nil {
+
+		// get the request the packet refers to
+		req := self.buffers[h.ReqId]
+		if req == nil {
 			Log("wsConn: got a response with unknown request id", h.ReqId, h)
 			continue
-		} else {
-			switch h.Kind {
-			case fcgiStdout:
-				if content, err := h.readContent(self.conn); err == nil {
-					// Log("wsConn: got STDOUT:", strconv.Quote(string(content)))
-					if len(content) > 0 {
-						req.Write(content)
-					} else {
-						req.Close()
-					}
+		}
+
+		// check the packet type
+		switch h.Kind {
+		case fcgiStdout:
+			if content, err := h.readContent(self.conn); err == nil {
+				if len(content) > 0 {
+					req.Write(content)
+				} else {
+					req.Close()
 				}
-			case fcgiStderr:
-				if content, err := h.readContent(self.conn); err == nil {
-					// Log("wsConn: got STDERR:", strconv.Quote(string(content)))
-					if len(content) > 0 {
-						req.WriteString("Error: ")
-						req.Write(content)
-						req.WriteString("\r\n")
-					}
-				}
-			case fcgiEndRequest:
-				Log("wsConn: got END_REQUEST", h.ReqId)
-				e := new(endRequest)
-				readStruct(self.conn, e)
-				// Log("wsConn: appStatus", e.AppStatus, "protocolStatus", e.ProtocolStatus)
-				buf := self.buffers[h.ReqId]
-				switch e.ProtocolStatus {
-				case fcgiRequestComplete:
-					// buf has been filled already by calls to .Write from inside some other Handler
-				case fcgiCantMpxConn:
-					buf.Reset()
-					buf.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder says it cannot multiplex connections.\r\n")
-				case fcgiOverloaded:
-					buf.Reset()
-					buf.WriteString("HTTP/1.1 503 Service Unavailable\r\n\r\nFastCGI Responder says it is overloaded.\r\n")
-				case fcgiUnknownRole:
-					buf.Reset()
-					buf.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder has been asked for an unknown role.\r\n")
-				}
-				self.signals[h.ReqId] <- true
-				// dont free the request id yet, because it might not have been read yet
-			default:
-				Log("wsConn: responder sent unknown packet type:", h.Kind, h)
 			}
+		case fcgiStderr:
+			if content, err := h.readContent(self.conn); err == nil {
+				if len(content) > 0 {
+					req.WriteString("Error: ")
+					req.Write(content)
+					req.WriteString("\r\n")
+				}
+			}
+		case fcgiEndRequest:
+			Log("wsConn: got END_REQUEST", h.ReqId)
+			readEndRequest(self.conn, req)
+			self.signals[h.ReqId] <- true
+			// dont free the request id yet, because it might not have been read yet
+		default:
+			Log("wsConn: responder sent unknown packet type:", h.Kind, h)
 		}
 	}
 close:
 	self.Close()
+}
+
+func readEndRequest(conn net.Conn, req *closeBuffer) {
+	e := new(endRequest)
+	readStruct(conn, e)
+	switch e.ProtocolStatus {
+	case fcgiRequestComplete:
+		// buf has been filled already by calls to .Write from inside some other Handler
+	case fcgiCantMpxConn:
+		req.Reset()
+		req.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder says it cannot multiplex connections.\r\n")
+	case fcgiOverloaded:
+		req.Reset()
+		req.WriteString("HTTP/1.1 503 Service Unavailable\r\n\r\nFastCGI Responder says it is overloaded.\r\n")
+	case fcgiUnknownRole:
+		req.Reset()
+		req.WriteString("HTTP/1.1 500 Internal Server Error\r\n\r\nFastCGI Responder has been asked for an unknown role.\r\n")
+	}
 }
 
 // Close closes the underlying connection to the FastCGI responder.

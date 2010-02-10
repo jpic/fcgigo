@@ -114,8 +114,6 @@ func stopAllServers(v ...net.Listener) {
 		a.Close()
 	}
 	os.Remove("_test/fcgi_test.html")
-	os.Remove("_test/listener_test_exec.out")
-	os.Remove("_test/listener_test_exec.out.8")
 }
 
 func runTest(test testRecord, j int, webaddr string, t *testing.T) {
@@ -164,6 +162,7 @@ func TestRunTests(t *testing.T) {
 	stopAllServers(tcplisten, unixlisten, weblisten)
 }
 
+// gotest: mkdir -p _test
 // gotest: make _test/listener_test_exec.out
 func TestRunMultiplexTests(t *testing.T) {
 	tcplisten, unixlisten, weblisten := startAllServers(t)

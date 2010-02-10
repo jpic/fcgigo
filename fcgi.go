@@ -3,13 +3,19 @@
 // license that can be found in the LICENSE file.
 
 /*
-This package implements FastCGI for use with http.Serve().  It provides two main pieces: fcgi.Handler and fcgi.Listener.
+This package implements FastCGI for use with http.Serve().  It provides
+two main pieces: fcgi.Handler and fcgi.Listener.
 
-fcgi.Handler returns a http.Handler that will do round-robin dispatch to remote FastCGI Responders to handle each request. You create one by calling fcgi.Handler().
+fcgi.Handler returns a http.Handler that will do round-robin dispatch
+to remote FastCGI Responders to handle each request. You create one by
+calling fcgi.Handler().
 
-fcgi.Listener is a net.Listener that you can pass to http.Serve() to produce a FastCGI Responder. You get one by calling fcgi.Listen().  See example and tests for details.
+fcgi.Listener is a net.Listener that you can pass to http.Serve()
+to produce a FastCGI Responder. You get one by calling fcgi.Listen().
+See example and tests for details.
 
-Example: You want a create a FastCGI responder that a webserver can connect to via a TCP socket.
+Example: You want a create a FastCGI responder that a webserver can
+connect to via a TCP socket.
 
 	package main
 
@@ -24,15 +30,21 @@ Example: You want a create a FastCGI responder that a webserver can connect to v
 
 	func main() {
 		http.Handle("/hello", http.HandlerFunc(HelloServer))
-		if listen, err := fcgi.Listen("tcp", "0.0.0.0:7134"); err == nil {
-			http.Serve(listen, nil)
+		listener, err := fcgi.Listen("tcp", "127.0.0.1:7134")
+		if err != nil {
+			return
 		}
+		http.Serve(listener, nil)
 	}
 
-Now, if you configured lighttpd to connect to ( "host" => "127.0.0.1", "port" => 7134 ),
-It will serve your hello, world application.
+Now, if you configured lighttpd to connect to:
+	( "host" => "127.0.0.1",
+	  "port" => 7134 )
 
-Example: You want to create an application that can be spawned by the webserver to service FastCGI requests.
+It would serve your hello, world application.
+
+Example: You want to create an application that can be spawned by the
+webserver to service FastCGI requests.
 
 	package main
 
@@ -42,14 +54,18 @@ Example: You want to create an application that can be spawned by the webserver 
 	)
 
 	func main() {
-		if listen, err := fcgi.Listen("exec", ""); err == nil {
-			http.Serve(listen, nil)
+		listener, err := fcgi.Listen("exec", "")
+		if err != nil {
+			return
 		}
+		http.Serve(listen, nil)
 	}
 
-Now, if you configured lighttpd to use ("bin-path" => "<path_to_your_executable>"), it will serve your hello, world application.
+Now, you would configure lighttpd to use:
+	( "bin-path" => "<path_to_your_executable>")
 
-Example: You have an existing FastCGI application running on a TCP host and want Go's http.Serve to send requests to it for servicing.
+Example: You have an existing FastCGI application running on a TCP host
+and want Go's http.Serve to send requests to it for servicing.
 
 	handler, err := fcgi.Handler([]string{
 		"tcp://127.0.0.1:7134",
@@ -59,7 +75,9 @@ Example: You have an existing FastCGI application running on a TCP host and want
 	http.Handle("/", handler)
 	http.ListenAndServe(":80", nil)
 
-Example: You want to serve static files, or errors, or anything, immediately, while sending only some other requests to a FastCGI Responder.
+Example: You want to serve static files, or errors, or anything,
+immediately, while sending only some other requests to a FastCGI
+Responder.
 
 	handler, err := fcgi.Handler([]string{
 		// ... as above ...
@@ -68,9 +86,12 @@ Example: You want to serve static files, or errors, or anything, immediately, wh
 	http.Handle("/static", http.FileServer(...))
 	http.ListenAndServe(":80", nil)
 
-In this example, the http server will use the FileServer to serve files from /static locally, but all other requests will be sent along to the Responder.
+In this example, the http server will use the FileServer to serve files
+from /static locally, but all other requests will be sent along to
+the Responder.
 
-See fcgi_test.go for examples of all the Listener and Handler types; also, how to use both a Handler and Listener in the same process.
+See fcgi_test.go for examples of all the Listener and Handler types;
+also, how to use both a Handler and Listener in the same process.
 (hint: they cannot share the same default muxer).
 
 */
@@ -171,22 +192,25 @@ func (self *header) readContent(r io.Reader) (b []byte, err os.Error) {
 		return b, nil
 	}
 	n, err := r.Read(b)
+	if err != nil {
+		return b[0:n], err
+	}
 	if n < int(self.ContentLength) {
 		return b[0:n], os.NewError(fmt.Sprint("Short read got ", n, "of", t))
-	} else if n < t {
+	}
+	if n < t {
 		// so we read the content but not the padding, which we _must_ read
-		pad := make([]byte, self.PaddingLength)
-		if m, err := r.Read(pad); err == nil {
-			if m < int(self.PaddingLength) {
-				return b[0:n], os.NewError(fmt.Sprint("Short read got ", n, "of", t, " and only", m, "of", self.PaddingLength, "padding"))
-			}
-		} else {
+		pad := make([]byte, t-n)
+		m, err := r.Read(pad)
+		if err != nil {
 			return b[0:n], os.NewError(fmt.Sprint("Failed to read padding:", err))
 		}
+		if m < int(self.PaddingLength) {
+			return b[0:n], os.NewError(fmt.Sprint("Short read got ", n, "of", t, " and only", m, "of", self.PaddingLength, "padding"))
+		}
 	}
-	// Log("readContent{",self.ContentLength,self.PaddingLength,"}: ",b[0:self.ContentLength],b[self.ContentLength:n])
 	// discard the padding bytes from the final selection
-	return b[0:self.ContentLength], err
+	return b[0:self.ContentLength], nil
 }
 
 // so we dont have to allocate new ones all the time, these are always zero, and we write slices of it for padding
