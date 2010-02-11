@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"strconv"
 	"fmt"
+	"encoding/binary"
 )
 
 // request holds the state for an in-progress request,
@@ -37,7 +38,7 @@ func newRequest(reqid uint16, conn io.ReadWriteCloser, flags uint8) *request {
 		params: map[string]string{},
 		stdin: new(bytes.Buffer),
 		data: new(bytes.Buffer),
-		close: ((flags & fcgiKeepConn) != fcgiKeepConn),
+		close: ((flags & flagKeepConn) != flagKeepConn),
 		startTime: time.Nanoseconds(),
 		conn: conn,
 	}
@@ -148,16 +149,16 @@ func (self *request) parseFcgiParams(text []byte) {
 	}
 }
 
-// fcgiListener is a net.Listener that you can pass to http.Serve(),
+// listener is a net.Listener that you can pass to http.Serve(),
 // http.Serve() will then, in effect, be running a FastCGI Responder
-type fcgiListener struct {
+type listener struct {
 	net.Listener
 	net string // tcp, unix, or exec
 	c   chan *rsConn
 	err chan os.Error
 }
 
-// Listen() creates a new fcgiListener of the specified net type.
+// Listen() creates a new listener of the specified net type.
 // Known values for net are: "tcp", "unix", and "exec".
 // For tcp, laddr is like "127.0.0.1:1234".
 // For unix, laddr is the absolute path to a socket.
@@ -169,12 +170,12 @@ func Listen(net string, laddr string) (net.Listener, os.Error) {
 	case "unix":
 		return listenUnix(laddr)
 	case "exec":
-		return listenFD(fcgiListenSockFileNo)
+		return listenFD(listenSockFileNo)
 	}
 	return nil, os.NewError(fmt.Sprint("Invalid network type.", net))
 }
 
-// listenTCP() creates a new fcgiListener on a tcp socket.
+// listenTCP() creates a new listener on a tcp socket.
 // listenAddress can be any resolvable local interface and port.
 func listenTCP(listenAddress string) (net.Listener, os.Error) {
 	var err os.Error
@@ -185,7 +186,7 @@ func listenTCP(listenAddress string) (net.Listener, os.Error) {
 	return nil, err
 }
 
-// listenUnix creates a new fcgiListener on a unix socket.
+// listenUnix creates a new listener on a unix socket.
 // socketPath should be the absolute path to the socket file.
 func listenUnix(socketPath string) (net.Listener, os.Error) {
 	if err := os.Remove(socketPath); err != nil {
@@ -208,7 +209,7 @@ func listenUnix(socketPath string) (net.Listener, os.Error) {
 	panic("listenUnix should not fall-through")
 }
 
-// listenFD creates a new fcgiListener on an already open socket.
+// listenFD creates a new listener on an already open socket.
 // fd is the file descriptor of the open socket.
 func listenFD(fd int) (net.Listener, os.Error) {
 	ret, err := listen("exec", newFDListener(fd))
@@ -216,12 +217,12 @@ func listenFD(fd int) (net.Listener, os.Error) {
 }
 
 // listen() is the private listener factory behind the different net types
-func listen(net string, listener net.Listener) (*fcgiListener, os.Error) {
-	if listener == nil {
+func listen(net string, l net.Listener) (*listener, os.Error) {
+	if l == nil {
 		return nil, os.NewError("listener cannot be nil")
 	}
-	self := &fcgiListener{
-		Listener: listener,
+	self := &listener{
+		Listener: l,
 		net: net,
 		c: make(chan *rsConn),
 		err: make(chan os.Error, 1),
@@ -231,7 +232,7 @@ func listen(net string, listener net.Listener) (*fcgiListener, os.Error) {
 	go func() {
 		for {
 			if c, err := self.Listener.Accept(); err == nil {
-				go self.readAllPackets(c) // once enough packets have been read, fcgiListener.Accept() will yield a connection
+				go self.readAllPackets(c) // once enough packets have been read, listener.Accept() will yield a connection
 			} else {
 				self.err <- err
 				break
@@ -245,7 +246,6 @@ func listen(net string, listener net.Listener) (*fcgiListener, os.Error) {
 		go func() {
 			for {
 				time.Sleep(5e9)
-				// our parent is gone, we need to die
 				if os.Getppid() == 1 {
 					os.Exit(1)
 				}
@@ -257,12 +257,12 @@ func listen(net string, listener net.Listener) (*fcgiListener, os.Error) {
 
 // readAllPackets is the goroutine that will read FCGI records off the real socket
 // and dispatch the rsConns to Accept() when they are ready
-func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
+func (self *listener) readAllPackets(conn io.ReadWriteCloser) {
 	requests := map[uint16]*request{}
 	h := &header{}
 	for {
 		h.Version = 0 // mark the packet as invalid
-		err := readStruct(conn, h)
+		err := binary.Read(conn, binary.BigEndian, h)
 		switch {
 		case err == os.EOF:
 			goto close
@@ -275,21 +275,21 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 		}
 		req, _ := requests[h.ReqId]
 		switch h.Kind {
-		case fcgiBeginRequest:
+		case typeBeginRequest:
 			b := new(beginRequest)
-			readStruct(conn, b)
+			binary.Read(conn, binary.BigEndian, b)
 			Log("Listener: got beginRequest", h.ReqId)
 			req = newRequest(h.ReqId, conn, b.Flags)
 			requests[h.ReqId] = req
-		case fcgiParams:
-			// Log("Listener: got fcgiParams")
+		case typeParams:
+			// Log("Listener: got typeParams")
 			if content, err := h.readContent(conn); err == nil {
 				req.parseFcgiParams(content)
 			} else {
 				Log("Error reading content:", err)
 			}
-		case fcgiStdin:
-			// Log("Listener: got fcgiStdin", h.ContentLength, "bytes")
+		case typeStdin:
+			// Log("Listener: got typeStdin", h.ContentLength, "bytes")
 			if h.ContentLength == uint16(0) {
 				// now the request has enough data to build our fake http.Conn
 				self.c <- newRsConn(conn, req)
@@ -301,24 +301,24 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 					Log("Error reading content:", err)
 				}
 			}
-		case fcgiGetValues:
-			Log("Listener: fcgiGetValues")
+		case typeGetValues:
+			Log("Listener: typeGetValues")
 			// TODO: respond with GET_VALUES_RESULT
-		case fcgiData:
+		case typeData:
 			if h.ContentLength > uint16(0) {
-				Log("Listener: got fcgiData", h.ContentLength, "bytes")
+				Log("Listener: got typeData", h.ContentLength, "bytes")
 				if content, err := h.readContent(conn); err == nil {
 					req.data.Write(content)
 				} else {
 					Log("Error reading content:", err)
 				}
 			}
-		case fcgiAbortRequest:
+		case typeAbortRequest:
 			Log("Listener: ABORT_REQUEST")
 			// can we pre-empt the worker go-routine? punt for now.
 			// spec says we should answer by ending the output streams
-			// req.fcgiWrite(fcgiStdout, "")
-			// req.fcgiWrite(fcgiStderr, "")
+			// req.endStream(typeStdout)
+			// req.endStream(typeStderr)
 			// but really, since the goroutine is still running,
 			// and will still send its own close messages
 			// pick your poison: either send too many closes,
@@ -326,7 +326,7 @@ func (self *fcgiListener) readAllPackets(conn io.ReadWriteCloser) {
 			// punting again.
 		default:
 			Log("Listener: Unknown packet header type: %d in %s", h.Kind, h)
-			fcgiWrite(conn, fcgiUnknownType, h.ReqId, []byte{h.Kind, 0, 0, 0, 0, 0, 0, 0})
+			writeRecord(conn, typeUnknownType, h.ReqId, []byte{h.Kind, 0, 0, 0, 0, 0, 0, 0})
 		}
 	}
 close:
@@ -336,7 +336,7 @@ close:
 
 // Accept() returns a rsConn as a net.Conn interface.
 // Will only return rsConns that are ready to Read a complete http.Request from.
-func (self *fcgiListener) Accept() (net.Conn, os.Error) {
+func (self *listener) Accept() (net.Conn, os.Error) {
 	select {
 	case c := <-self.c:
 		if c == nil {
@@ -352,18 +352,18 @@ func (self *fcgiListener) Accept() (net.Conn, os.Error) {
 	panic("Accept should never fall through")
 }
 
-func (self *fcgiListener) Close() os.Error {
+func (self *listener) Close() os.Error {
 	Log("Listener: Close()")
 	return self.Listener.Close()
 }
 
 
 // rsConn is the responder-side of a connection to the webserver, it looks like a net.Conn.
-// It is created automatically by readAllPackets() and returned by fcgiListener.Accept() from inside http.Serve().
+// It is created automatically by readAllPackets() and returned by listener.Accept() from inside http.Serve().
 // It won't be created until a complete request has been buffered off a real socket.
 // Read() here will read from that request buffer only, never a real socket.
-//  - Its possible that in the future calls to Read() would be unbuffered and block waiting for chunks of fcgiStdin,etc to arrive.
-// Write() will send fcgiStdout records back to the web server.
+//  - Its possible that in the future calls to Read() would be unbuffered and block waiting for chunks of typeStdin,etc to arrive.
+// Write() will send typeStdout records back to the web server.
 type rsConn struct {
 	reqId      uint16             // the request id to put in the headers of the output packets
 	conn       io.ReadWriteCloser // the ReadWriteCloser to do real I/O on
@@ -400,24 +400,22 @@ func (self *rsConn) Write(p []byte) (n int, err os.Error) {
 	if len(p) == 0 {
 		self.closedOut = true
 	}
-	return fcgiWrite(self.conn, fcgiStdout, self.reqId, p)
+	return len(p), writeRecord(self.conn, typeStdout, self.reqId, p)
 }
 
-func (self *rsConn) fcgiWrite(kind uint8, str string) (n int, err os.Error) {
-	if kind == fcgiStdout && self.closedOut {
-		return 0, nil
-	} else if kind == fcgiStderr && self.closedErr {
-		return 0, nil
+func (self *rsConn) endStream(kind uint8) (err os.Error) {
+	if kind == typeStdout && self.closedOut {
+		return nil
+	} else if kind == typeStderr && self.closedErr {
+		return nil
 	}
-	if len(str) == 0 {
-		switch kind {
-		case fcgiStdout:
-			self.closedOut = true
-		case fcgiStderr:
-			self.closedErr = true
-		}
+	switch kind {
+	case typeStdout:
+		self.closedOut = true
+	case typeStderr:
+		self.closedErr = true
 	}
-	return fcgiWrite(self.conn, kind, self.reqId, strings.Bytes(str))
+	return writeRecord(self.conn, kind, self.reqId, []byte{})
 }
 
 // ASSUMPTION:
@@ -429,16 +427,16 @@ func (self *rsConn) Close() os.Error {
 	// Log("rsConn: Close() -> sending CLOSE and END messages for this request.")
 	// send the done messages
 	if !self.closedOut {
-		self.fcgiWrite(fcgiStdout, "")
+		self.endStream(typeStdout)
 	}
 	if !self.closedErr {
-		self.fcgiWrite(fcgiStderr, "")
+		self.endStream(typeStderr)
 	}
 	// write the final packet
-	writeStruct(self.conn, newHeader(fcgiEndRequest, self.reqId, 8))
-	writeStruct(self.conn, (&endRequest{
+	binary.Write(self.conn, binary.BigEndian, newHeader(typeEndRequest, self.reqId, 8))
+	binary.Write(self.conn, binary.BigEndian, (&endRequest{
 		AppStatus: 200,
-		ProtocolStatus: fcgiRequestComplete,
+		ProtocolStatus: statusRequestComplete,
 	}))
 	// did the webserver request that we close this connection
 	if self.close {
@@ -448,6 +446,7 @@ func (self *rsConn) Close() os.Error {
 	// Log("rsConn: Done closing.")
 	return nil
 }
+
 func (self *rsConn) LocalAddr() net.Addr  { return self.localAddr }
 func (self *rsConn) RemoteAddr() net.Addr { return self.remoteAddr }
 func (self *rsConn) SetTimeout(nsec int64) os.Error {

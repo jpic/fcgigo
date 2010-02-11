@@ -9,6 +9,7 @@ GOFILES=\
 	fcgi.go\
 	listener.go\
 	handler.go\
+	exec.go\
 
 include $(GOROOT)/src/Make.pkg
 

@@ -117,42 +117,42 @@ func dontLog(k string, v ...) {}
 
 const (
 	// The fd to use when we are execed by the web-server
-	fcgiListenSockFileNo = iota
+	listenSockFileNo = iota
 
 	// Packet Types (header.Kind)
-	fcgiBeginRequest
-	fcgiAbortRequest
-	fcgiEndRequest
-	fcgiParams
-	fcgiStdin
-	fcgiStdout
-	fcgiStderr
-	fcgiData
-	fcgiGetValues
-	fcgiGetValuesResult
-	fcgiUnknownType
-	fcgiMaxType = fcgiUnknownType
+	typeBeginRequest
+	typeAbortRequest
+	typeEndRequest
+	typeParams
+	typeStdin
+	typeStdout
+	typeStderr
+	typeData
+	typeGetValues
+	typeGetValuesResult
+	typeUnknownType
+	typeMaxType = typeUnknownType
 )
 
 // Keep the connection between web-server and responder open after request
-const fcgiKeepConn = 1
+const flagKeepConn = 1
 
 // Max amount of data in a FastCGI record body
-const fcgiMaxWrite = 65535
+const maxWrite = 65535
 
 // Roles (beginRequest.Roles)
 const (
-	fcgiResponder = iota + 1 // only Responders are implemented.
-	fcgiAuthorizer
-	fcgiFilter
+	roleResponder = iota + 1 // only Responders are implemented.
+	roleAuthorizer
+	roleFilter
 )
 
 // ProtocolStatus (in endRequest)
 const (
-	fcgiRequestComplete = iota
-	fcgiCantMpxConn
-	fcgiOverloaded
-	fcgiUnknownRole
+	statusRequestComplete = iota
+	statusCantMultiplex
+	statusOverloaded
+	statusUnknownRole
 )
 
 type header struct {
@@ -220,27 +220,24 @@ func (self *header) writePadding(w io.Writer) os.Error {
 	p := self.PaddingLength
 	if p > 0 {
 		if p > 7 {
-			return os.NewError(fmt.Sprint("fcgiWrite: invalid padding requested:", p, "should be less than 8."))
+			return os.NewError(fmt.Sprint("writeRecord: invalid padding requested:", p, "should be less than 8."))
 		}
 		pad := paddingSource[0:p]
-		// Log("fcgiWrite: Padding", pad)
 		_, err := w.Write(pad)
 		return err
 	}
 	return nil
 }
 
-// fcgiWrite() writes a single FastCGI record to a Writer
-func fcgiWrite(conn io.Writer, kind uint8, reqId uint16, b []byte) (n int, err os.Error) {
+// writeRecord() writes a single FastCGI record to a Writer, being careful to write the correct padding.
+func writeRecord(conn io.Writer, kind uint8, reqId uint16, b []byte) (err os.Error) {
 	h := newHeader(kind, reqId, len(b))
-	// Log("fcgiWrite: Header", conn, h)
-	writeStruct(conn, h)
+	binary.Write(conn, binary.BigEndian, h)
 	if len(b) > 0 {
-		n, err = conn.Write(b)
-		// Log("fcgiWrite: Body", b)
+		_, err = conn.Write(b)
 		h.writePadding(conn)
 	}
-	return n, err
+	return err
 }
 
 // FastCGI has its own pair encoding: <name-len><val-len><name><val>, with a couple kinks.
@@ -279,7 +276,7 @@ func encodeSize(size int) []byte {
 }
 
 // when the webserver sends us "ACCEPT_ENCODING" as a header,
-// (in the fcgiParams) standardize it like: Accept-Encoding
+// (in the typeParams records) standardize it like: Accept-Encoding
 func standardCase(str []byte) string {
 	ret := make([]byte, len(str))
 	first := true
@@ -295,24 +292,6 @@ func standardCase(str []byte) string {
 		}
 	}
 	return string(ret)
-}
-
-// write a struct in binary encoding to a writer
-func writeStruct(w io.Writer, data interface{}) os.Error {
-	err := binary.Write(w, binary.BigEndian, data)
-	if err != nil && err != os.EOF {
-		Log("WriteTo Error:", err)
-	}
-	return err
-}
-
-// read a struct in binary encoding from a reader
-func readStruct(r io.Reader, data interface{}) (err os.Error) {
-	err = binary.Read(r, binary.BigEndian, data)
-	if err != nil && err != os.EOF {
-		Log("ReadFrom Error:", err)
-	}
-	return err
 }
 
 // a reader that supports a dummy Close()

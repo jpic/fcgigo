@@ -91,10 +91,10 @@ func startAllServers(t *testing.T) (tcplisten, unixlisten, weblisten net.Listene
 	// define the muxer for the http server to use
 	// (all requests go to the pool of listeners)
 	wd, _ := os.Getwd()
-	handler, err := fcgi.Handler([]string{
-		"tcp://" + tcplisten.Addr().String(),
-		"unix://" + wd + "/_test/unixsocket",
-		"exec://" + wd + "/_test/listener_test_exec.out", // will be ForkExec'd by the Handler (right now)
+	handler, err := fcgi.Handler([]fcgi.Dialer{
+		fcgi.NewDialer("tcp", tcplisten.Addr().String()),
+		fcgi.NewDialer("unix", wd+"/_test/unixsocket"),
+		fcgi.NewDialer("exec", wd+"/_test/listener_test_exec.out"),
 	})
 	if err != nil {
 		t.Fatal(err)
