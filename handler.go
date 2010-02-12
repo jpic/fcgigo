@@ -16,6 +16,7 @@ import (
 	"http"
 	"fmt"
 	"encoding/binary"
+	"syscall"
 )
 
 type Dialer interface {
@@ -72,6 +73,7 @@ func Handler(dialers []Dialer) (http.Handler, os.Error) {
 		Log("Dialing:", d)
 		r, err := d.Dial()
 		if err != nil {
+			Log("Error:", err)
 			e += 1
 			continue
 		}
@@ -87,19 +89,21 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 	var response *http.Response
 	var err os.Error
 	var body []byte
+	Log("Handler: got a request, fetching a responder")
 	// get the next available responder
 	responder := <-self.responders
-	// a multiplexing responder is available again immediately
-	if responder.multiplex {
-		self.responders <- responder
-	}
 	// send the request to the FastCGI responder
 	reqid, err := responder.WriteRequest(conn, req)
 	if err != nil {
-		Log("Handler: Failed to write request:", err)
+		Log("Handler: Failed to write request (disabling responder):", err)
 		conn.WriteHeader(http.StatusInternalServerError)
 		io.WriteString(conn, err.String())
+		responder.Close()
 		return
+	}
+	// a multiplexing responder is available again immediately
+	if responder.multiplex {
+		self.responders <- responder
 	}
 	// read the response (blocking)
 	if response, err = responder.ReadResponse(reqid, req.Method); err != nil {
@@ -127,6 +131,7 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 
 // wsConn is the webserver-side of a connection to a FastCGI Responder
 type wsConn struct {
+	net       string
 	addr      string
 	pid       int // only meaningful when addr is exec:...
 	conn      io.ReadWriteCloser
@@ -142,8 +147,8 @@ func newWsConn(conn io.ReadWriteCloser, multiplex bool) *wsConn {
 	}
 	self := &wsConn{
 		conn: conn,
-		buffers: make([]*bytes.Buffer, 256),
-		signals: make([]chan bool, 256),
+		buffers: make([]*bytes.Buffer, 4096),
+		signals: make([]chan bool, 4096),
 		nextId: 1,
 		multiplex: multiplex,
 	}
@@ -180,7 +185,7 @@ func (self *wsConn) readAllPackets() {
 			goto disconnected
 		case h.Version != 1:
 			Log("wsConn: read a header with invalid version", h.Version, h)
-			continue
+			goto disconnected
 		}
 
 		// get the request the packet refers to
@@ -212,7 +217,7 @@ func (self *wsConn) readAllPackets() {
 		}
 	}
 disconnected:
-	self.conn.Close() // just in case it isnt closed already
+	self.Close() // just in case it isnt closed already
 }
 
 func readEndRequest(conn io.Reader, buf *bytes.Buffer) {
@@ -235,17 +240,20 @@ func readEndRequest(conn io.Reader, buf *bytes.Buffer) {
 
 // getNextReqId is an iterator that produces un-used request ids.
 func (self *wsConn) getNextReqId() (reqid uint16) {
-	start := self.nextId
-	for self.buffers[self.nextId] != nil {
-		self.nextId = (self.nextId + 1) % uint16(len(self.buffers))
-		if self.nextId == 0 {
-			self.nextId = 1
-		}
-		if self.nextId == start {
-			return 0
+	// avoid searching for a free id by keeping track of the most likely next free one
+	// freeReqId will set self.nextId as well to help avoid searching
+	if self.buffers[self.nextId] == nil {
+		self.nextId += 1
+		return self.nextId - 1
+	}
+	// then only search if we have to
+	for n := 1; n < len(self.buffers); n++ {
+		if self.buffers[n] == nil {
+			self.nextId = uint16(n + 1)
+			return uint16(n)
 		}
 	}
-	return self.nextId
+	return 0
 }
 
 // freeReqId marks a reqId as usable for another request on this connection.
@@ -335,4 +343,14 @@ func (self *wsConn) ReadResponse(reqid uint16, method string) (ret *http.Respons
 	ret, err = http.ReadResponse(bufio.NewReader(self.buffers[reqid]), method)
 	self.freeReqId(reqid)
 	return ret, err
+}
+
+// Close ends our connection with the responder.  If the responder was an "exec"
+// responder, then we kill the process (since there is no way to reconnect to it).
+func (self *wsConn) Close() os.Error {
+	if self.net == "exec" && self.pid > 0 {
+		Log("Handler: closing 'exec' child process...")
+		syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGTERM, 0)
+	}
+	return self.conn.Close()
 }

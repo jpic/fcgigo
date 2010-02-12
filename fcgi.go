@@ -102,6 +102,7 @@ package fcgi
 // handler.go defines fcgi.Handler, et al
 
 import (
+	"log"
 	"os"
 	"io"
 	"encoding/binary"
@@ -114,6 +115,8 @@ import (
 var Log = dontLog
 
 func dontLog(k string, v ...) {}
+
+var doLog = log.Stderr
 
 const (
 	// The fd to use when we are execed by the web-server
@@ -191,29 +194,22 @@ func (self *header) readContent(r io.Reader) (b []byte, err os.Error) {
 	if t == 0 {
 		return b, nil
 	}
-	n, err := r.Read(b)
-	if err != nil {
-		return b[0:n], err
-	}
-	if n < int(self.ContentLength) {
-		return b[0:n], os.NewError(fmt.Sprint("Short read got ", n, "of", t))
-	}
-	if n < t {
-		// so we read the content but not the padding, which we _must_ read
-		pad := make([]byte, t-n)
-		m, err := r.Read(pad)
+	n := 0
+	// dont allow short reads, we either get it all or we fail because of an error
+	// if anything gets left on the wire, or goes unread, the whole connection is hosed
+	for n < t {
+		m, err := r.Read(b[n:])
+		n += m
 		if err != nil {
-			return b[0:n], os.NewError(fmt.Sprint("Failed to read padding:", err))
-		}
-		if m < int(self.PaddingLength) {
-			return b[0:n], os.NewError(fmt.Sprint("Short read got ", n, "of", t, " and only", m, "of", self.PaddingLength, "padding"))
+			return b[0:n], os.NewError(fmt.Sprint("Short read only got ", n, "of", t, "bytes:", err))
 		}
 	}
 	// discard the padding bytes from the final selection
 	return b[0:self.ContentLength], nil
 }
 
-// so we dont have to allocate new ones all the time, these are always zero, and we write slices of it for padding
+// so we dont have to allocate new ones all the time, these are always zero,
+// and we write slices of it for padding
 var paddingSource = make([]byte, 256)
 
 func (self *header) writePadding(w io.Writer) os.Error {
@@ -223,19 +219,38 @@ func (self *header) writePadding(w io.Writer) os.Error {
 			return os.NewError(fmt.Sprint("writeRecord: invalid padding requested:", p, "should be less than 8."))
 		}
 		pad := paddingSource[0:p]
-		_, err := w.Write(pad)
-		return err
+		// dont allow for short writes unless there is an error to explain it
+		n := 0
+		for uint8(n) < p {
+			m, err := w.Write(pad[n:])
+			if err != nil {
+				return err
+			}
+			n += m
+		}
 	}
 	return nil
 }
 
-// writeRecord() writes a single FastCGI record to a Writer, being careful to write the correct padding.
+// writeRecord writes a single FastCGI record to a Writer, being careful to write the correct padding.
 func writeRecord(conn io.Writer, kind uint8, reqId uint16, b []byte) (err os.Error) {
 	h := newHeader(kind, reqId, len(b))
-	binary.Write(conn, binary.BigEndian, h)
+	if err = binary.Write(conn, binary.BigEndian, h); err != nil {
+		return err
+	}
 	if len(b) > 0 {
-		_, err = conn.Write(b)
-		h.writePadding(conn)
+		// make sure we dont have any short Writes without an error
+		n := 0
+		for n < len(b) {
+			m, err := conn.Write(b[n:])
+			if err != nil {
+				return err
+			}
+			n += m
+		}
+		if err = h.writePadding(conn); err != nil {
+			return err
+		}
 	}
 	return err
 }
