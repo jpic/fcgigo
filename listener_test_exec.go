@@ -9,6 +9,7 @@ import (
 	"http/fcgi"
 	"io"
 	"flag"
+	"log"
 )
 
 var net *string = flag.String("net", "exec", "What type of network to listen on.")
@@ -31,7 +32,12 @@ func main() {
 	}))
 	// for testing the serving of static files
 	http.Handle("/static/", http.FileServer(".", "/static"))
-	if listen, err := fcgi.Listen(*net, *bind); err == nil {
-		http.Serve(listen, nil)
+
+	// start the listener
+	listen, err := fcgi.Listen(*net, *bind)
+	if err != nil {
+		log.Stderr("Failed to create listen socket.")
+		return
 	}
+	http.Serve(listen, nil)
 }
