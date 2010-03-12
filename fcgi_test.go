@@ -10,7 +10,6 @@ import (
 	"http"
 	"testing"
 	"os"
-	"strings"
 	"strconv"
 	"net"
 	"http/fcgi"
@@ -40,39 +39,43 @@ type headerRecord struct {
 // all the different tests we are set up to do, their URLs and expected results
 var tests = []testRecord{
 	testRecord{
-		URL: "/hello/",
+		URL:        "/hello/",
 		StatusCode: 200,
 		BodyPrefix: "hello, world",
 	},
 	testRecord{
-		URL: "/static/fcgi_test.html",
-		StatusCode: 200,
-		BodyPrefix: "hello static world",
-	},
-	testRecord{
-		URL: "/notfound/",
+		URL:        "/notfound/",
 		StatusCode: 404,
 		BodyPrefix: "",
 	},
 	testRecord{
-		URL: "/connection/",
+		URL:        "/connection/",
 		StatusCode: 200,
 		BodyPrefix: "connection test",
 		Headers: []headerRecord{
 			headerRecord{Key: "Connection", Val: "keep-alive"},
 		},
 	},
+	testRecord{
+		URL:        "/static/fcgi_test.html",
+		StatusCode: 200,
+		BodyPrefix: "hello static world",
+	},
 }
 
 // each test is repeated N times
-var repeatCount = 60 // should be an even multiple of len(responders) inside the handler, so that we test every responder equally
+var repeatCount = 6 // should be an even multiple of len(responders) inside the handler, so that we test every responder equally
 
 func createStaticTestFile() os.Error {
 	f, err := os.Open("_test/fcgi_test.html", os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
 		return err
 	}
+	block := make([]byte, 8192)
 	io.WriteString(f, "hello static world")
+	for i := 0; i < 128; i++ {
+		f.Write(block)
+	}
 	f.Close()
 	return nil
 }
@@ -122,7 +125,9 @@ func startAllServers(t *testing.T) (tcplisten, unixlisten, weblisten net.Listene
 }
 func stopAllServers(v ...net.Listener) {
 	for _, a := range v {
-		a.Close()
+		if a != nil {
+			a.Close()
+		}
 	}
 	removeStaticTestFile()
 }
@@ -130,7 +135,7 @@ func stopAllServers(v ...net.Listener) {
 func runTest(test testRecord, j int, webaddr string, t *testing.T) {
 	var response *http.Response
 	var err os.Error
-	defer func() { done <- 1 }()
+	defer func() { done <- j }()
 	url := "http://" + webaddr + test.URL
 	if response, _, err = http.Get(url); err != nil {
 		t.Error(err)
@@ -178,9 +183,16 @@ func TestRunTests(t *testing.T) {
 func TestRunMultiplexTests(t *testing.T) {
 	tcplisten, unixlisten, weblisten := startAllServers(t)
 	webaddr := weblisten.Addr().String()
+	C := 30
+	start := make(chan bool, C)
+	for i := 0; i < C; i++ {
+		start <- true
+	}
 	for _, test := range tests {
 		for j := 0; j < repeatCount; j++ {
+			<-start
 			go runTest(test, j, webaddr, t)
+			start <- true
 		}
 	}
 	for i := 0; i < len(tests)*repeatCount; i++ {
@@ -189,7 +201,7 @@ func TestRunMultiplexTests(t *testing.T) {
 	stopAllServers(tcplisten, unixlisten, weblisten)
 }
 
-var helloWorldBytes = strings.Bytes("Hello, world!")
+var helloWorldBytes = []byte("Hello, world!")
 
 func BenchmarkStaticFileOverTCPNoMultiplex(b *testing.B) {
 	b.StopTimer()
@@ -308,12 +320,12 @@ func BenchmarkStaticFileOverTCPWithMultiplex(b *testing.B) {
 				return
 			}
 			if response != nil {
-				_, err := ioutil.ReadAll(response.Body)
+				body, err := ioutil.ReadAll(response.Body)
 				if err != nil {
 					log.Stderr("ioutil.ReadAll error:", err)
 					return
 				}
-				// b.SetBytes(int64(len(body)))
+				b.SetBytes(int64(len(body)))
 				response.Body.Close()
 			}
 		}()
@@ -446,62 +458,111 @@ func BenchmarkHelloWorldOverTCPWithMultiplex(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		<-done
 	}
+	log.Stderr("Finished.")
 	weblisten.Close()
 	tcplisten.Close()
 	removeStaticTestFile()
 }
-/*
-func BenchmarkStaticFileOverUnix(b *testing.B) {
+
+func BenchmarkStaticFileOverHTTPNoMultiplex(b *testing.B) {
 	b.StopTimer()
-	fcgiMux := http.NewServeMux()
-	fcgiMux.Handle("/static/", http.FileServer("_test/", "/static"))
+	http.Handle("/static/", http.FileServer("_test/", "/static"))
 	if err := createStaticTestFile(); err != nil {
-		log.Stderr("Failed to create test file:",err)
-		return
-	}
-	tcplisten, err := fcgi.Listen("tcp", ":0")
-	if err != nil {
-		log.Stderr("fcgi.Listen error:",err)
+		log.Stderr("Failed to create test file:", err)
 		return
 	}
 	weblisten, err := net.Listen("tcp", ":0")
 	if err != nil {
-		log.Stderr("net.Listen error:",err)
+		log.Stderr("net.Listen error:", err)
 		return
 	}
 	url := "http://" + weblisten.Addr().String() + "/static/fcgi_test.html"
-	handler, err := fcgi.Handler([]fcgi.Dialer{
-		fcgi.NewDialer("tcp", tcplisten.Addr().String()),
-	})
-	if err != nil {
-		log.Stderr("fcgi.Handler error:",err)
-		return
-	}
-	http.Handle("/static/", handler)
-	go http.Serve(tcplisten, fcgiMux)
 	go http.Serve(weblisten, nil)
 	b.StartTimer()
-	log.Stderr("Loop starting...",b.N)
+	log.Stderr("Loop starting...", b.N)
 	for i := 0; i < b.N; i++ {
 		response, _, err := http.Get(url)
 		if err != nil {
-			log.Stderr("http.Get error:",err)
+			log.Stderr("http.Get error:", err)
 		}
 		if response == nil {
 			log.Stderr("Nil response.")
 			continue
 		}
+		if response.StatusCode != 200 {
+			log.Stderr("Bad response status:", response.StatusCode)
+			continue
+		}
 		if response != nil {
 			body, err := ioutil.ReadAll(response.Body)
 			if err != nil {
-				log.Stderr("ioutil.ReadAll error:",err)
+				log.Stderr("ioutil.ReadAll error:", err)
 				break
 			}
+			response.Body.Close()
 			b.SetBytes(int64(len(body)))
 		}
 	}
 	weblisten.Close()
-	tcplisten.Close()
 	removeStaticTestFile()
 }
-*/
+
+func BenchmarkStaticFileOverHTTPWithMultiplex(b *testing.B) {
+	b.StopTimer()
+	var C = 50 // number of simultaneous clients
+	http.Handle("/static/", http.FileServer("_test/", "/static"))
+	if err := createStaticTestFile(); err != nil {
+		log.Stderr("Failed to create test file:", err)
+		return
+	}
+	weblisten, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Stderr("net.Listen error:", err)
+		return
+	}
+	url := "http://" + weblisten.Addr().String() + "/static/fcgi_test.html"
+	go http.Serve(weblisten, nil)
+
+	start := make(chan bool, C) // allow this many simultaneous connections to the webserver
+	for i := 0; i < C; i++ {
+		start <- true
+	}
+	done := make(chan bool, b.N) // for syncing all the multiplex goroutines
+	b.StartTimer()
+	log.Stderr("Loop starting...", b.N)
+	for i := 0; i < b.N; i++ {
+		go func() {
+			<-start
+			defer func() {
+				done <- true
+				start <- true
+			}()
+			response, _, err := http.Get(url)
+			if err != nil {
+				log.Stderr("http.Get error:", err)
+			}
+			if response == nil {
+				log.Stderr("Nil response.")
+				return
+			}
+			if response.StatusCode != 200 {
+				log.Stderr("Bad response status:", response.StatusCode)
+				return
+			}
+			if response != nil {
+				body, err := ioutil.ReadAll(response.Body)
+				if err != nil {
+					log.Stderr("ioutil.ReadAll error:", err)
+					return
+				}
+				b.SetBytes(int64(len(body)))
+				response.Body.Close()
+			}
+		}()
+	}
+	for i := 0; i < b.N; i++ {
+		<-done
+	}
+	weblisten.Close()
+	removeStaticTestFile()
+}
