@@ -108,6 +108,7 @@ import (
 	"encoding/binary"
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 // Log is the logging function used throughout this package.
@@ -177,11 +178,15 @@ type beginRequest struct {
 	Reserved [5]uint8
 }
 
+func (self *header) String() string {
+	return fmt.Sprintf("<ver: %d kind: %d id: %d len: %d pad: %d>", self.Version, self.Kind, self.ReqId, self.ContentLength, self.PaddingLength)
+}
+
 func newHeader(kind uint8, id uint16, content_length int) *header {
 	return &header{
-		Version: 1,
-		Kind: kind,
-		ReqId: id,
+		Version:       1,
+		Kind:          kind,
+		ReqId:         id,
 		ContentLength: uint16(content_length),
 		PaddingLength: uint8(-content_length & 7),
 	}
@@ -232,10 +237,15 @@ func (self *header) writePadding(w io.Writer) os.Error {
 	return nil
 }
 
+
 // writeRecord writes a single FastCGI record to a Writer, being careful to write the correct padding.
-func writeRecord(conn io.Writer, kind uint8, reqId uint16, b []byte) (err os.Error) {
+// now uses a lockable RWC so that the header-body-padding writes are atomic on this conn
+func writeRecord(conn *lockReadWriteCloser, kind uint8, reqId uint16, b []byte) (err os.Error) {
+	conn.w.Lock()
+	defer conn.w.Unlock()
 	h := newHeader(kind, reqId, len(b))
 	if err = binary.Write(conn, binary.BigEndian, h); err != nil {
+		Log("writeRecord[", reqId, "]: error", err)
 		return err
 	}
 	if len(b) > 0 {
@@ -253,6 +263,38 @@ func writeRecord(conn io.Writer, kind uint8, reqId uint16, b []byte) (err os.Err
 		}
 	}
 	return err
+}
+
+func writeBeginRequest(conn *lockReadWriteCloser, reqid uint16, role uint16, flags uint8) (n int, err os.Error) {
+	conn.w.Lock()
+	defer conn.w.Unlock()
+	if err = binary.Write(conn, binary.BigEndian, newHeader(typeBeginRequest, reqid, 8)); err != nil {
+		return 0, err
+	}
+	if err = binary.Write(conn, binary.BigEndian, beginRequest{
+		Role:  roleResponder,
+		Flags: flags,
+	}); err != nil {
+		return 0, err
+	}
+	// Log("writeRecord[",reqid,"]: beginRequest")
+	return 16, nil
+}
+
+func writeEndRequest(conn *lockReadWriteCloser, reqid uint16, appStatus uint32, protocolStatus uint8) (n int, err os.Error) {
+	conn.w.Lock()
+	defer conn.w.Unlock()
+	if err = binary.Write(conn, binary.BigEndian, newHeader(typeEndRequest, reqid, 8)); err != nil {
+		return 0, err
+	}
+	if err = binary.Write(conn, binary.BigEndian, endRequest{
+		AppStatus:      appStatus,
+		ProtocolStatus: protocolStatus,
+	}); err != nil {
+		return 8, err
+	}
+	// Log("writeRecord[",reqid,"]: endRequest")
+	return 16, nil
 }
 
 // FastCGI has its own pair encoding: <name-len><val-len><name><val>, with a couple kinks.
@@ -332,4 +374,13 @@ func atoi(s string, i int) (n, i1 int, ok bool) {
 		}
 	}
 	return n, i, true
+}
+
+// we need to synchronize multiplexed access to the same I/O connections
+// unlike the RWMutex in the sync package, the Read lock cannot be open
+// by an arbitrary number of readers, only one at a time
+type lockReadWriteCloser struct {
+	io.ReadWriteCloser
+	w sync.Mutex
+	r sync.Mutex
 }
