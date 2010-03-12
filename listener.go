@@ -34,13 +34,13 @@ type request struct {
 
 func newRequest(reqid uint16, conn io.ReadWriteCloser, flags uint8) *request {
 	return &request{
-		reqId: reqid,
-		params: map[string]string{},
-		stdin: new(bytes.Buffer),
-		data: new(bytes.Buffer),
-		close: ((flags & flagKeepConn) != flagKeepConn),
+		reqId:     reqid,
+		params:    map[string]string{},
+		stdin:     new(bytes.Buffer),
+		data:      new(bytes.Buffer),
+		close:     ((flags & flagKeepConn) != flagKeepConn),
 		startTime: time.Nanoseconds(),
-		conn: conn,
+		conn:      conn,
 	}
 }
 func getRequest(reqid uint16, conn *http.Conn, req *http.Request) *request {
@@ -49,26 +49,26 @@ func getRequest(reqid uint16, conn *http.Conn, req *http.Request) *request {
 		// close: req.Close, // this is not right because whether the ws<->fcgi connection stays up is separate from whether the browser<->ws connection goes down
 		close: false, // by default we want to keep the connection open
 		params: map[string]string{
-			"SERVER_SOFTWARE": "fcgigo-server",
-			"HTTP_HOST": req.Host,
-			"SERVER_NAME": req.Host,
-			"REQUEST_URI": req.RawURL,
-			"REQUEST_METHOD": req.Method,
+			"SERVER_SOFTWARE":   "fcgigo-server",
+			"HTTP_HOST":         req.Host,
+			"SERVER_NAME":       req.Host,
+			"REQUEST_URI":       req.RawURL,
+			"REQUEST_METHOD":    req.Method,
 			"GATEWAY_INTERFACE": "FCGI/1.0",
-			"SERVER_PORT": "0", //TODO
-			"SERVER_ADDR": "127.0.0.1",
-			"SERVER_PROTOCOL": req.Proto,
-			"REMOTE_PORT": "0",
-			"REMOTE_ADDR": conn.RemoteAddr,
-			"SCRIPT_FILENAME": "", // TODO: this wouldnt be defined for a remote responder, but would if it were spawned. deferred until we support dynamic spawning again (ie have unit tests).
-			"SCRIPT_NAME": req.URL.Path, // TODO: this should be the path portion of the url matched by the ServeMux pattern
-			"PATH_INFO": "", // TODO: this should be the remainder of the path AFTER the ServeMux pattern is stripped from the front
-			"DOCUMENT_ROOT": "",
-			"PATH_TRANSLATED": "", // depends on PATH_INFO and DOCUMENT_ROOT
-			"QUERY_STRING": req.URL.RawQuery,
+			"SERVER_PORT":       "0", //TODO
+			"SERVER_ADDR":       "127.0.0.1",
+			"SERVER_PROTOCOL":   req.Proto,
+			"REMOTE_PORT":       "0",
+			"REMOTE_ADDR":       conn.RemoteAddr,
+			"SCRIPT_FILENAME":   "",           // TODO: this wouldnt be defined for a remote responder, but would if it were spawned. deferred until we support dynamic spawning again (ie have unit tests).
+			"SCRIPT_NAME":       req.URL.Path, // TODO: this should be the path portion of the url matched by the ServeMux pattern
+			"PATH_INFO":         "",           // TODO: this should be the remainder of the path AFTER the ServeMux pattern is stripped from the front
+			"DOCUMENT_ROOT":     "",
+			"PATH_TRANSLATED":   "", // depends on PATH_INFO and DOCUMENT_ROOT
+			"QUERY_STRING":      req.URL.RawQuery,
 		},
 		stdin: new(bytes.Buffer),
-		data: new(bytes.Buffer),
+		data:  new(bytes.Buffer),
 	}
 	// set a default DOCUMENT_ROOT
 	if dir, err := os.Getwd(); err != nil {
@@ -91,7 +91,6 @@ func getRequest(reqid uint16, conn *http.Conn, req *http.Request) *request {
 			return c
 		},
 			"HTTP_"+strings.ToUpper(k))
-		//Log("Saving Param:", k, v)
 		self.params[k] = v
 	}
 	return self
@@ -100,9 +99,9 @@ func (self *request) getHttpRequest() (h *http.Request) {
 	h = &http.Request{
 		Method: self.params["REQUEST_METHOD"],
 		RawURL: self.params["REQUEST_URI"],
-		Proto: self.params["SERVER_PROTOCOL"],
-		Close: self.close,
-		Body: nopCloser{Reader: self.stdin},
+		Proto:  self.params["SERVER_PROTOCOL"],
+		Close:  self.close,
+		Body:   nopCloser{Reader: self.stdin},
 		Header: map[string]string{},
 	}
 	if h.Proto[0:4] != "HTTP" {
@@ -125,7 +124,7 @@ func (self *request) getHttpRequest() (h *http.Request) {
 	}
 	for key, val := range self.params {
 		if strings.HasPrefix(key, "HTTP_") {
-			h.Header[standardCase(strings.Bytes(key)[5:])] = val
+			h.Header[standardCase([]byte(key)[5:])] = val
 		}
 	}
 	return h
@@ -145,7 +144,6 @@ func (self *request) parseFcgiParams(text []byte) {
 		key, slice = getOneValue(slice, key_len)
 		val, slice = getOneValue(slice, val_len)
 		self.params[key] = val
-		//Log("Param:", key, val)
 	}
 }
 
@@ -223,16 +221,18 @@ func listen(net string, l net.Listener) (*listener, os.Error) {
 	}
 	self := &listener{
 		Listener: l,
-		net: net,
-		c: make(chan *rsConn),
-		err: make(chan os.Error, 1),
+		net:      net,
+		c:        make(chan *rsConn, 1),
+		err:      make(chan os.Error, 1),
 	}
 	// start a goroutine that calls Accept on the real listener
 	// then starts reading packets from it until it's complete enough to Accept
 	go func() {
 		for {
 			if c, err := self.Listener.Accept(); err == nil {
-				go self.readAllPackets(c) // once enough packets have been read, listener.Accept() will yield a connection
+				lc := new(lockReadWriteCloser)
+				lc.ReadWriteCloser = c
+				go self.readAllPackets(lc)
 			} else {
 				self.err <- err
 				break
@@ -245,7 +245,7 @@ func listen(net string, l net.Listener) (*listener, os.Error) {
 		// so here, in the exec'd child, we start a slow-poll to check if our parent has died
 		go func() {
 			for {
-				time.Sleep(5e9)
+				time.Sleep(7e9)
 				if os.Getppid() == 1 {
 					os.Exit(1)
 				}
@@ -255,66 +255,80 @@ func listen(net string, l net.Listener) (*listener, os.Error) {
 	return self, nil
 }
 
-// readAllPackets is the goroutine that will read FCGI records off the real socket
+// readAllPackets is the goroutine that will read FCGI records off the conn
 // and dispatch the rsConns to Accept() when they are ready
-func (self *listener) readAllPackets(conn io.ReadWriteCloser) {
+func (self *listener) readAllPackets(conn *lockReadWriteCloser) {
 	requests := map[uint16]*request{}
-	h := &header{}
+	h := new(header)
+	locked := false
 	for {
-		h.Version = 0 // mark the packet as invalid
+
+		// lock the connection until we read the header AND content
+		// we have to do it in 2 reads, because we dont know how much to read
+		// until after we inspect the header, and no one else can read in-between
+		conn.r.Lock()
+		locked = true // for cleaning up the lock later,
+		// cant simply defer conn.r.Unlock(), because it has to toggle per-loop
+
+		// read the header
 		err := binary.Read(conn, binary.BigEndian, h)
+
+		// check for errors
 		switch {
 		case err == os.EOF:
-			goto close
+			goto disconnected
 		case err != nil:
-			Log("Listener: error reading header", err)
-			goto close
+			self.Log("error reading header", err)
+			goto disconnected
 		case h.Version != 1:
-			Log("Listener: got an invalid header", h)
-			goto close
+			self.Log("got an invalid header", h)
+			goto disconnected
 		}
+
+		// get the request, if any
 		req, _ := requests[h.ReqId]
+		// we dont check if req exists because this might be the beginRequest for it
+
+		// check the kind of packet
 		switch h.Kind {
 		case typeBeginRequest:
 			b := new(beginRequest)
 			binary.Read(conn, binary.BigEndian, b)
-			Log("Listener: got beginRequest", h.ReqId)
+			// self.Log("got beginRequest", h.ReqId)
 			req = newRequest(h.ReqId, conn, b.Flags)
 			requests[h.ReqId] = req
 		case typeParams:
-			// Log("Listener: got typeParams")
 			if content, err := h.readContent(conn); err == nil {
 				req.parseFcgiParams(content)
 			} else {
-				Log("Error reading content:", err)
+				self.Log("Error reading typeParams content:", err)
 			}
 		case typeStdin:
-			// Log("Listener: got typeStdin", h.ContentLength, "bytes")
 			if h.ContentLength == uint16(0) {
 				// now the request has enough data to build our fake http.Conn
 				self.c <- newRsConn(conn, req)
 				// this will cause Accept() to trigger and release an rsConn for the server to use
+				// if no other goroutine has called Accept(), then this
 			} else {
 				if content, err := h.readContent(conn); err == nil {
 					req.stdin.Write(content)
 				} else {
-					Log("Error reading content:", err)
+					self.Log("Error reading typeStdincontent:", err)
 				}
 			}
 		case typeGetValues:
-			Log("Listener: typeGetValues")
+			self.Log("TODO: typeGetValues")
 			// TODO: respond with GET_VALUES_RESULT
 		case typeData:
 			if h.ContentLength > uint16(0) {
-				Log("Listener: got typeData", h.ContentLength, "bytes")
 				if content, err := h.readContent(conn); err == nil {
 					req.data.Write(content)
 				} else {
-					Log("Error reading content:", err)
+					self.Log("Error reading content:", err)
 				}
 			}
 		case typeAbortRequest:
-			Log("Listener: ABORT_REQUEST")
+			self.Log("ABORT_REQUEST")
 			// can we pre-empt the worker go-routine? punt for now.
 			// spec says we should answer by ending the output streams
 			// req.endStream(typeStdout)
@@ -325,12 +339,18 @@ func (self *listener) readAllPackets(conn io.ReadWriteCloser) {
 			// or send them late (with spurious data in between)
 			// punting again.
 		default:
-			Log("Listener: Unknown packet header type: %d in %s", h.Kind, h)
+			self.Log("Unknown packet header type: %d in %s", h.Kind, h)
 			writeRecord(conn, typeUnknownType, h.ReqId, []byte{h.Kind, 0, 0, 0, 0, 0, 0, 0})
 		}
+
+		// unlock the connection
+		conn.r.Unlock()
+		locked = false
 	}
-close:
-	Log("Listener: calling conn.Close()")
+disconnected:
+	if locked {
+		conn.r.Unlock()
+	}
 	conn.Close()
 }
 
@@ -353,8 +373,13 @@ func (self *listener) Accept() (net.Conn, os.Error) {
 }
 
 func (self *listener) Close() os.Error {
-	Log("Listener: Close()")
+	self.Log("Close()")
 	return self.Listener.Close()
+}
+
+func (self *listener) Log(msg string, v ...) {
+	msg = fmt.Sprintf("Listener(%s): %s", self.net, msg)
+	Log(msg, v)
 }
 
 
@@ -365,24 +390,24 @@ func (self *listener) Close() os.Error {
 //  - Its possible that in the future calls to Read() would be unbuffered and block waiting for chunks of typeStdin,etc to arrive.
 // Write() will send typeStdout records back to the web server.
 type rsConn struct {
-	reqId      uint16             // the request id to put in the headers of the output packets
-	conn       io.ReadWriteCloser // the ReadWriteCloser to do real I/O on
-	buf        *bytes.Buffer      // the buffer that .Read() will read from
-	remoteAddr net.Addr           // this should be the address of the far remote, the user's IP at their browser
-	localAddr  net.Addr           // this is undefined, is it the webserver or the responder? but its required
-	close      bool               // whether, when closed, to also close conn
-	closedOut  bool               // did the EOF STDOUT messages get sent already?
-	closedErr  bool               // did the EOF STDERR messages get sent already?
+	reqId      uint16               // the request id to put in the headers of the output packets
+	conn       *lockReadWriteCloser // the ReadWriteCloser to do real I/O on
+	buf        *bytes.Buffer        // the buffer that .Read() will read from
+	remoteAddr net.Addr             // this should be the address of the far remote, the user's IP at their browser
+	localAddr  net.Addr             // this is undefined, is it the webserver or the responder? but its required
+	close      bool                 // whether, when closed, to also close conn
+	closedOut  bool                 // did the EOF STDOUT messages get sent already?
+	closedErr  bool                 // did the EOF STDERR messages get sent already?
 }
 
-func newRsConn(conn io.ReadWriteCloser, req *request) *rsConn {
+func newRsConn(conn *lockReadWriteCloser, req *request) *rsConn {
 	f := &rsConn{
-		reqId: req.reqId,
-		conn: conn,
-		buf: new(bytes.Buffer),
+		reqId:      req.reqId,
+		conn:       conn,
+		buf:        new(bytes.Buffer),
 		remoteAddr: &net.TCPAddr{net.IPv4(127, 0, 0, 1), 0}, // TODO
-		localAddr: &net.TCPAddr{net.IPv4(127, 0, 0, 1), 0}, // TODO
-		close: req.close,
+		localAddr:  &net.TCPAddr{net.IPv4(127, 0, 0, 1), 0}, // TODO
+		close:      req.close,
 	}
 	// fill our buffer with the output of the given http.Request
 	req.getHttpRequest().Write(f.buf)
@@ -433,17 +458,14 @@ func (self *rsConn) Close() os.Error {
 		self.endStream(typeStderr)
 	}
 	// write the final packet
-	binary.Write(self.conn, binary.BigEndian, newHeader(typeEndRequest, self.reqId, 8))
-	binary.Write(self.conn, binary.BigEndian, (&endRequest{
-		AppStatus: 200,
-		ProtocolStatus: statusRequestComplete,
-	}))
+	if _, err := writeEndRequest(self.conn, self.reqId, 200, statusRequestComplete); err != nil {
+		return err
+	}
 	// did the webserver request that we close this connection
 	if self.close {
 		Log("rsConn: Close()ing real connection to web-server.")
 		self.conn.Close()
 	}
-	// Log("rsConn: Done closing.")
 	return nil
 }
 
