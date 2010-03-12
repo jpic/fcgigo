@@ -21,7 +21,6 @@ import (
 
 type Dialer interface {
 	Dial() (io.ReadWriteCloser, os.Error)
-	Network() string
 	Addr() net.Addr
 }
 
@@ -51,6 +50,16 @@ func (self *dialer) Dial() (rwc io.ReadWriteCloser, err os.Error) {
 	return rwc, nil
 }
 
+type dialerAddr struct {
+	net  string
+	addr string
+}
+
+func (a *dialerAddr) Network() string { return a.net }
+func (a *dialerAddr) String() string  { return a.addr }
+
+func (self *dialer) Addr() net.Addr { return &dialerAddr{net: self.net, addr: self.addr} }
+
 func NewDialer(net string, addr string) Dialer {
 	return &dialer{net: net, addr: addr}
 }
@@ -77,7 +86,7 @@ func Handler(dialers []Dialer) (http.Handler, os.Error) {
 			e += 1
 			continue
 		}
-		self.responders <- newWsConn(r, true)
+		self.responders <- newWsConn(r, d.Addr(), true)
 	}
 	if e == len(dialers) {
 		return nil, os.NewError("None of the Dialers you provided successfully connected.")
@@ -89,13 +98,12 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 	var response *http.Response
 	var err os.Error
 	var body []byte
-	Log("Handler: got a request, fetching a responder")
 	// get the next available responder
 	responder := <-self.responders
 	// send the request to the FastCGI responder
 	reqid, err := responder.WriteRequest(conn, req)
 	if err != nil {
-		Log("Handler: Failed to write request (disabling responder):", err)
+		Log("Handler: Failed to write request to", responder, "disabling (error:", err, ")")
 		conn.WriteHeader(http.StatusInternalServerError)
 		io.WriteString(conn, err.String())
 		responder.Close()
@@ -107,7 +115,7 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 	}
 	// read the response (blocking)
 	if response, err = responder.ReadResponse(reqid, req.Method); err != nil {
-		Log("Handler: Failed to read response:", err)
+		Log("Handler: Failed to read response from", responder, "error:", err)
 		conn.WriteHeader(http.StatusInternalServerError)
 		io.WriteString(conn, err.String())
 		return
@@ -122,7 +130,7 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 	}
 	conn.WriteHeader(response.StatusCode)
 	if body, err = ioutil.ReadAll(response.Body); err != nil {
-		Log("Handler: Error reading response.Body:", err)
+		Log("Handler: Error reading response.Body from", responder, "(error:", err, ")")
 		io.WriteString(conn, err.String())
 		return
 	}
@@ -133,27 +141,32 @@ func (self *handler) ServeHTTP(conn *http.Conn, req *http.Request) {
 type wsConn struct {
 	net       string
 	addr      string
-	pid       int // only meaningful when addr is exec:...
-	conn      io.ReadWriteCloser
+	pid       int // only meaningful when addr is exec
+	conn      *lockReadWriteCloser
 	buffers   []*bytes.Buffer // the buffer for the response data
 	signals   []chan bool     // used to signal ReadResponse
 	nextId    uint16          // the reqId of the next request on this connection
 	multiplex bool            // does the responder on the other side support multiplex?
 }
 
-func newWsConn(conn io.ReadWriteCloser, multiplex bool) *wsConn {
+func newWsConn(conn io.ReadWriteCloser, addr net.Addr, multiplex bool) *wsConn {
 	if conn == nil {
 		return nil
 	}
+	c := new(lockReadWriteCloser)
+	c.ReadWriteCloser = conn
 	self := &wsConn{
-		conn: conn,
-		buffers: make([]*bytes.Buffer, 4096),
-		signals: make([]chan bool, 4096),
-		nextId: 1,
+		net:       addr.Network(),
+		addr:      addr.String(),
+		conn:      c,
+		buffers:   make([]*bytes.Buffer, 4096),
+		signals:   make([]chan bool, 4096),
+		nextId:    1,
 		multiplex: multiplex,
 	}
 	for i, _ := range self.signals {
 		self.signals[i] = make(chan bool, 1) // if the request completes before the ReadResponse, it shouldnt block
+		self.buffers[i] = nil
 	}
 	// start the goroutine that will read all the response packets and assemble them
 	go self.readAllPackets()
@@ -165,15 +178,16 @@ func (self *wsConn) String() string {
 	if self == nil {
 		return "nil"
 	}
-	return fmt.Sprint("{wsConn@", self.conn, "}")
+	return fmt.Sprint("{wsConn@", self.addr, "}")
 }
 
 // readAllPackets is a goroutine that reads everything from the connection
 // and dispatches responses when they are complete (typeEndRequest is recieved).
 func (self *wsConn) readAllPackets() {
-	h := &header{}
+	// we only create one header instance, and refill it as packets arrive
+	h := new(header)
 	for {
-		h.Version = 0
+		// read the header
 		err := binary.Read(self.conn, binary.BigEndian, h)
 
 		// check errors
@@ -181,39 +195,45 @@ func (self *wsConn) readAllPackets() {
 		case err == os.EOF:
 			goto disconnected
 		case err != nil:
-			Log("wsConn: error reading FcgiHeader:", err)
+			self.Log("error reading header:", err)
 			goto disconnected
 		case h.Version != 1:
-			Log("wsConn: read a header with invalid version", h.Version, h)
+			self.Log("header has INVALID VERSION", h.Version, h)
 			goto disconnected
 		}
 
 		// get the request the packet refers to
 		buf := self.buffers[h.ReqId]
+
+		// check that the request exists
 		if buf == nil {
-			Log("wsConn: got a response with unknown request id", h.ReqId, h)
+			self.Log("header has UNKNOWN REQUEST ID", h.ReqId, h)
 			continue
 		}
 
 		// check the packet type
 		switch h.Kind {
 		case typeStdout:
-			if content, err := h.readContent(self.conn); err == nil && len(content) > 0 {
-				buf.Write(content)
+			content, err := h.readContent(self.conn)
+			if err != nil {
+				self.Log("Failed to readContent from typeStdout:", err)
+				break
 			}
+			buf.Write(content)
 		case typeStderr:
-			if content, err := h.readContent(self.conn); err == nil && len(content) > 0 {
-				buf.WriteString("Error: ")
-				buf.Write(content)
-				buf.WriteString("\r\n")
+			content, err := h.readContent(self.conn)
+			if err != nil {
+				self.Log("Failed to readContent from typeStderr:", err)
 			}
+			buf.WriteString("Error: ")
+			buf.Write(content)
+			buf.WriteString("\r\n")
 		case typeEndRequest:
-			Log("wsConn: got END_REQUEST", h.ReqId)
 			readEndRequest(self.conn, buf)
+			// signal to ReadResponse that the buffer is full and ready to read
 			self.signals[h.ReqId] <- true
-			// dont free the request id yet, because it might not have been read yet
 		default:
-			Log("wsConn: responder sent unknown packet type:", h.Kind, h)
+			self.Log("responder sent unknown packet type:", h.Kind, h)
 		}
 	}
 disconnected:
@@ -270,17 +290,11 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 	freq := getRequest(reqid, con, req)
 	// allocate the buffer for the response
 	self.buffers[reqid] = new(bytes.Buffer)
-	// then compute the flags first
-	// default to keeping the fcgi connection open
+	// then compute the fcgi flags
+	// default to keeping the server<->responder connection open
 	flags := uint8(flagKeepConn)
-	// send a beginRequest
-	if err = binary.Write(self.conn, binary.BigEndian, newHeader(typeBeginRequest, reqid, 8)); err != nil {
-		return 0, err
-	}
-	if err = binary.Write(self.conn, binary.BigEndian, beginRequest{
-		Role: roleResponder,
-		Flags: flags,
-	}); err != nil {
+	// send a beginRequest packet
+	if _, err = writeBeginRequest(self.conn, reqid, roleResponder, flags); err != nil {
 		return 0, err
 	}
 	// encode the params to a byte slice
@@ -302,7 +316,7 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 		if n == 0 || err == os.EOF {
 			break
 		} else if err != nil {
-			Log("wsConn: Error reading request.stdin:", err)
+			self.Log("Error reading request.stdin:", err)
 			break
 		} else {
 			if err = writeRecord(self.conn, typeStdin, reqid, buf2[0:n]); err != nil {
@@ -320,7 +334,7 @@ func (self *wsConn) WriteRequest(con *http.Conn, req *http.Request) (reqid uint1
 		if n == 0 || err == os.EOF {
 			break
 		} else if err != nil {
-			Log("Error reading request.data:", err)
+			self.Log("Error reading request.data:", err)
 			break
 		} else {
 			if err = writeRecord(self.conn, typeData, reqid, buf2[0:n]); err != nil {
@@ -349,8 +363,17 @@ func (self *wsConn) ReadResponse(reqid uint16, method string) (ret *http.Respons
 // responder, then we kill the process (since there is no way to reconnect to it).
 func (self *wsConn) Close() os.Error {
 	if self.net == "exec" && self.pid > 0 {
-		Log("Handler: closing 'exec' child process...")
+		self.Log("closing 'exec' child process...")
 		syscall.Syscall(syscall.SYS_KILL, uintptr(self.pid), syscall.SIGTERM, 0)
 	}
+	// wake up any blocked ReadResponse calls (which will fail when awoken early)
+	for i := 0; i < len(self.signals); i++ {
+		self.signals[i] <- true
+	}
 	return self.conn.Close()
+}
+
+func (self *wsConn) Log(msg string, v ...) {
+	msg = fmt.Sprintf("wsConn(%s): %s", self.net, msg)
+	Log(msg, v)
 }
