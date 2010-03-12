@@ -53,7 +53,9 @@ haveSocket:
 		return nil, os.NewError(fmt.Sprint("Listen failed:", syscall.Errstr(errno)))
 	}
 	// then ForkExec a new process, and give this listening socket to them as stdin
-	if _, errno = syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd}); errno != 0 {
+	// DEBUG: for now, give the new process our stdout, and stderr, but the spec says these should be closed
+	// in reality, we should redirect, capture, and possibly log separately
+	if _, errno = syscall.ForkExec(file, []string{}, []string{}, dir, []int{fd, 1, 2}); errno != 0 {
 		Log("ForkExec failed:", syscall.Errstr(errno))
 		return nil, os.NewError(fmt.Sprint("ForkExec failed:", syscall.Errstr(errno)))
 	}
