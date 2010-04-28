@@ -67,9 +67,9 @@ Now, you would configure lighttpd to use:
 Example: You have an existing FastCGI application running on a TCP host
 and want Go's http.Serve to send requests to it for servicing.
 
-	handler, err := fcgi.Handler([]string{
-		"tcp://127.0.0.1:7134",
-		"tcp://127.0.0.1:7135",
+	handler, err := fcgi.Handler([]fcgi.Dialer{
+		fcgi.NewDialer("tcp", "127.0.0.1:7134"),
+		fcgi.NewDialer("unix", "/tmp/app.sock"),
 		// ... repeat for each responder ...
 	})
 	http.Handle("/", handler)
